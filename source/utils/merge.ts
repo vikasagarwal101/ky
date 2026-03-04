@@ -1,4 +1,4 @@
-import type {KyHeadersInit, Options} from '../types/options.js';
+import type {KyHeadersInit, Options, SearchParamsOption} from '../types/options.js';
 import type {Hooks} from '../types/hooks.js';
 import {supportsAbortSignal} from '../core/constants.js';
 import {isObject} from './is.js';
@@ -44,7 +44,7 @@ export const mergeHooks = (original: Hooks = {}, incoming: Hooks = {}): Required
 	}
 );
 
-const appendSearchParameters = (target: any, source: any): URLSearchParams => {
+const appendSearchParameters = (target: SearchParamsOption | undefined, source: SearchParamsOption): URLSearchParams => {
 	const result = new URLSearchParams();
 
 	for (const input of [target, source]) {
@@ -62,7 +62,8 @@ const appendSearchParameters = (target: any, source: any): URLSearchParams => {
 					throw new TypeError('Array search parameters must be provided in [[key, value], ...] format');
 				}
 
-				result.append(String(pair[0]), String(pair[1]));
+				const [key, value] = pair;
+				result.append(String(key), String(value));
 			}
 		} else if (isObject(input)) {
 			for (const [key, value] of Object.entries(input)) {
@@ -71,7 +72,6 @@ const appendSearchParameters = (target: any, source: any): URLSearchParams => {
 				}
 			}
 		} else {
-			// String
 			const parameters = new URLSearchParams(input);
 			for (const [key, value] of parameters.entries()) {
 				result.append(key, value);
@@ -82,23 +82,32 @@ const appendSearchParameters = (target: any, source: any): URLSearchParams => {
 	return result;
 };
 
-// TODO: Make this strongly-typed (no `any`).
+type MergeTarget = Record<string, unknown> | unknown[];
+
+const asMergeRecord = (value: MergeTarget): Record<string, unknown> => {
+	if (Array.isArray(value) || !isObject(value)) {
+		return {};
+	}
+
+	return value;
+};
+
 export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
-	let returnValue: any = {};
-	let headers = {};
-	let hooks = {};
-	let searchParameters: any;
+	let returnValue: MergeTarget = {};
+	let headers: KyHeadersInit = {};
+	let hooks: Hooks = {};
+	let searchParameters: SearchParamsOption | undefined;
 	const signals: AbortSignal[] = [];
 
 	for (const source of sources) {
 		if (Array.isArray(source)) {
-			if (!Array.isArray(returnValue)) {
-				returnValue = [];
-			}
-
-			returnValue = [...returnValue, ...source];
+			const current: unknown[] = Array.isArray(returnValue) ? returnValue : [];
+			returnValue = [...current, ...source];
 		} else if (isObject(source)) {
-			for (let [key, value] of Object.entries(source)) {
+			const sourceRecord = source as Record<string, unknown>;
+			let resultRecord = asMergeRecord(returnValue);
+
+			for (let [key, value] of Object.entries(sourceRecord)) {
 				// Special handling for AbortSignal instances
 				if (key === 'signal' && value instanceof globalThis.AbortSignal) {
 					signals.push(value);
@@ -111,12 +120,12 @@ export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
 						throw new TypeError('The `context` option must be an object');
 					}
 
-					// Shallow merge: always create a new object to prevent mutation bugs
-					returnValue = {
-						...returnValue,
+					const existingContext = isObject(resultRecord['context']) ? resultRecord['context'] : {};
+					resultRecord = {
+						...resultRecord,
 						context: (value === undefined || value === null)
 							? {}
-							: {...returnValue.context, ...value},
+							: {...existingContext, ...value},
 					};
 					continue;
 				}
@@ -124,52 +133,58 @@ export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
 				// Special handling for searchParams
 				if (key === 'searchParams') {
 					if (value === undefined || value === null) {
-						// Explicit undefined or null removes searchParams
 						searchParameters = undefined;
 					} else {
-						// First source: keep as-is to preserve type (string/object/URLSearchParams)
-						// Subsequent sources: merge and convert to URLSearchParams
-						searchParameters = searchParameters === undefined ? value : appendSearchParameters(searchParameters, value);
+						const next = value as SearchParamsOption;
+						searchParameters = searchParameters === undefined ? next : appendSearchParameters(searchParameters, next);
 					}
 
 					continue;
 				}
 
-				if (isObject(value) && key in returnValue) {
-					value = deepMerge(returnValue[key], value);
+				if (isObject(value) && key in resultRecord) {
+					value = deepMerge(resultRecord[key] as Record<string, unknown>, value);
 				}
 
-				returnValue = {...returnValue, [key]: value};
+				resultRecord = {...resultRecord, [key]: value};
 			}
 
-			if (isObject((source as any).hooks)) {
-				hooks = mergeHooks(hooks, (source as any).hooks);
-				returnValue.hooks = hooks;
+			if (isObject(sourceRecord['hooks'])) {
+				hooks = mergeHooks(hooks, sourceRecord['hooks'] as Hooks);
+				resultRecord['hooks'] = hooks;
 			}
 
-			if (isObject((source as any).headers)) {
-				headers = mergeHeaders(headers, (source as any).headers);
-				returnValue.headers = headers;
+			if (isObject(sourceRecord['headers'])) {
+				headers = mergeHeaders(headers, sourceRecord['headers'] as KyHeadersInit);
+				resultRecord['headers'] = headers;
 			}
+
+			returnValue = resultRecord;
 		}
 	}
 
+	if (Array.isArray(returnValue)) {
+		return returnValue as T;
+	}
+
+	const mergedRecord = asMergeRecord(returnValue);
+
 	if (searchParameters !== undefined) {
-		returnValue.searchParams = searchParameters;
+		mergedRecord['searchParams'] = searchParameters;
 	}
 
 	if (signals.length > 0) {
 		if (signals.length === 1) {
-			returnValue.signal = signals[0];
+			mergedRecord['signal'] = signals[0];
 		} else if (supportsAbortSignal) {
-			returnValue.signal = AbortSignal.any(signals);
+			mergedRecord['signal'] = AbortSignal.any(signals);
 		} else {
 			// When AbortSignal.any is not available, use the last signal
 			// This maintains the previous behavior before signal merging was added
 			// This can be remove when the `supportsAbortSignal` check is removed.`
-			returnValue.signal = signals.at(-1);
+			mergedRecord['signal'] = signals.at(-1);
 		}
 	}
 
-	return returnValue;
+	return mergedRecord as T;
 };
