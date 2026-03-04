@@ -736,6 +736,24 @@ test('searchParams option', async t => {
 	t.is(await ky(server.url, {searchParams: customStringParameters}).text(), customStringParameters);
 });
 
+test('searchParams option coerces non-string values without type assertions', async t => {
+	const server = await createHttpTestServer(t);
+
+	server.get('/', (request, response) => {
+		response.end(request.url.slice(1));
+	});
+
+	t.is(
+		await ky(server.url, {searchParams: {page: 2, active: false, query: 'ky'}}).text(),
+		'?page=2&active=false&query=ky',
+	);
+
+	t.is(
+		await ky(server.url, {searchParams: [['retry', 3], ['enabled', true], ['mode', 'safe']]}).text(),
+		'?retry=3&enabled=true&mode=safe',
+	);
+});
+
 test('searchParams option with undefined values', async t => {
 	const server = await createHttpTestServer(t);
 
