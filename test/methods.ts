@@ -43,25 +43,17 @@ test('method defaults to "GET"', async t => {
 	);
 });
 
-test.failing('custom method remains identical', async t => {
+test('lowercase custom method currently throws before request dispatch', async t => {
 	const server = await createHttpTestServer(t);
 	server.all('/', (_request, response) => {
 		response.end();
 	});
 
-	t.plan(1);
-
-	await t.notThrowsAsync(
-		// TODO: Is it correct for this to throw 400 status code?
+	// Current Node.js/undici behavior can reject lowercase custom methods (for example `report`)
+	// before the request reaches the target server. This test documents that current contract.
+	await t.throwsAsync(
 		ky(server.url, {
 			method: 'report',
-			hooks: {
-				beforeRequest: [
-					({options}) => {
-						t.is(options.method, 'report');
-					},
-				],
-			},
 		}),
 	);
 });
