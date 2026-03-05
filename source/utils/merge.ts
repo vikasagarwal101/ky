@@ -97,7 +97,12 @@ const appendSearchParameters = (target: SearchParamsOption | undefined, source: 
 type MergeTarget = Record<string, unknown> | unknown[];
 
 const asMergeRecord = (value: MergeTarget): Record<string, unknown> => {
-	if (Array.isArray(value) || !isObject(value)) {
+	if (Array.isArray(value)) {
+		// Preserve numeric index entries from arrays (equivalent to object spread)
+		return {...value};
+	}
+
+	if (!isObject(value)) {
 		return {};
 	}
 
