@@ -841,7 +841,12 @@ test('deepMerge preserves array indices when merging with object', async t => {
 
 	// When merging an array first, then an object, the array indices should be preserved
 	const result = deepMerge([1, 2, 3], {foo: 'bar'});
-	t.deepEqual(result, {0: 1, 1: 2, 2: 3, foo: 'bar'}, 'array indices should be preserved when merging with object');
+	t.deepEqual(result, {
+		0: 1,
+		1: 2,
+		2: 3,
+		foo: 'bar',
+	}, 'array indices should be preserved when merging with object');
 });
 
 test('throwHttpErrors option', async t => {

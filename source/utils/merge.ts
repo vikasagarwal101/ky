@@ -163,6 +163,12 @@ const mergeRecordEntry = (
 		return resultRecord;
 	}
 
+	// Skip hooks/headers - let mergeSpecialOptions handle them exclusively
+	if (key === 'hooks' || key === 'headers') {
+		return resultRecord;
+	}
+
+	// Deep merge objects that already exist in the result
 	if (isObject(value) && key in resultRecord) {
 		const existingValue = resultRecord[key] as Record<string, unknown>;
 		value = deepMerge<Record<string, unknown>>(existingValue, value as Record<string, unknown>);
@@ -235,10 +241,18 @@ export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
 		returnValue = resultRecord;
 	}
 
+	// Handle array return value - apply special options without converting to object
 	if (Array.isArray(returnValue)) {
+		const arrayRecord = returnValue as unknown as Record<string, unknown>;
+		if (state.searchParameters !== undefined) {
+			arrayRecord['searchParams'] = state.searchParameters;
+		}
+
+		mergeSignalValues(arrayRecord, state.signals);
 		return returnValue as T;
 	}
 
+	// Convert to record to apply special options
 	const mergedRecord = asMergeRecord(returnValue);
 
 	if (state.searchParameters !== undefined) {
