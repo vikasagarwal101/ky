@@ -736,6 +736,52 @@ test('searchParams option', async t => {
 	t.is(await ky(server.url, {searchParams: customStringParameters}).text(), customStringParameters);
 });
 
+test('searchParams option coerces non-string values without type assertions', async t => {
+	const server = await createHttpTestServer(t);
+
+	server.get('/', (request, response) => {
+		response.end(request.url.slice(1));
+	});
+
+	t.is(
+		await ky(server.url, {searchParams: {page: 2, active: false, query: 'ky'}}).text(),
+		'?page=2&active=false&query=ky',
+	);
+
+	t.is(
+		await ky(server.url, {searchParams: [['retry', 3], ['enabled', true], ['mode', 'safe']]}).text(),
+		'?retry=3&enabled=true&mode=safe',
+	);
+});
+
+test('searchParams merge preserves non-string coercion for instance and request options', async t => {
+	const server = await createHttpTestServer(t);
+	server.get('/', (request, response) => {
+		response.end(request.url);
+	});
+
+	const client = ky.create({
+		searchParams: {
+			page: 1,
+			active: true,
+		},
+	});
+
+	const responseText = await client.get(server.url, {
+		searchParams: {
+			page: 2,
+			includeDrafts: false,
+		},
+	}).text();
+
+	const url = new URL(responseText, server.url);
+
+	t.deepEqual(url.searchParams.getAll('page'), ['1', '2']);
+	t.is(url.searchParams.get('active'), 'true');
+	t.is(url.searchParams.get('includeDrafts'), 'false');
+	t.false(responseText.includes('[object Object]'));
+});
+
 test('searchParams option with undefined values', async t => {
 	const server = await createHttpTestServer(t);
 

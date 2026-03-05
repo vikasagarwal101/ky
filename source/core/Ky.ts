@@ -248,13 +248,21 @@ export class Ky {
 	}
 
 	// eslint-disable-next-line unicorn/prevent-abbreviations
-	static #normalizeSearchParams(searchParams: SearchParamsOption): SearchParamsOption {
-		// Filter out undefined values from plain objects
-		if (searchParams && typeof searchParams === 'object' && !Array.isArray(searchParams) && !(searchParams instanceof URLSearchParams)) {
-			return Object.fromEntries(Object.entries(searchParams).filter(([, value]) => value !== undefined));
+	static #normalizeSearchParams(searchParams: SearchParamsOption): SearchParamsInit {
+		if (searchParams === undefined || typeof searchParams === 'string' || searchParams instanceof URLSearchParams) {
+			return searchParams;
 		}
 
-		return searchParams;
+		if (Array.isArray(searchParams)) {
+			return searchParams.map(([key, value]) => [String(key), String(value)]);
+		}
+
+		// Filter out undefined values from plain objects and normalize values to strings
+		return Object.fromEntries(
+			Object.entries(searchParams)
+				.filter(([, value]) => value !== undefined)
+				.map(([key, value]) => [key, String(value)]),
+		);
 	}
 
 	public request: Request;
@@ -355,7 +363,7 @@ export class Ky {
 			// eslint-disable-next-line unicorn/prevent-abbreviations
 			const textSearchParams = typeof this.#options.searchParams === 'string'
 				? this.#options.searchParams.replace(/^\?/, '')
-				: new URLSearchParams(Ky.#normalizeSearchParams(this.#options.searchParams) as unknown as SearchParamsInit).toString();
+				: new URLSearchParams(Ky.#normalizeSearchParams(this.#options.searchParams)).toString();
 			// eslint-disable-next-line unicorn/prevent-abbreviations
 			const searchParams = '?' + textSearchParams;
 			const url = this.request.url.replace(/(?:\?.*?)?(?=#|$)/, searchParams);
