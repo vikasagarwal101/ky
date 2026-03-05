@@ -44,38 +44,50 @@ export const mergeHooks = (original: Hooks = {}, incoming: Hooks = {}): Required
 	}
 );
 
+const appendSearchParameterInput = (result: URLSearchParams, input: SearchParamsOption): void => {
+	if (input instanceof URLSearchParams) {
+		for (const [key, value] of input.entries()) {
+			result.append(key, value);
+		}
+
+		return;
+	}
+
+	if (Array.isArray(input)) {
+		for (const pair of input) {
+			if (!Array.isArray(pair) || pair.length !== 2) {
+				throw new TypeError('Array search parameters must be provided in [[key, value], ...] format');
+			}
+
+			const [key, value] = pair;
+			result.append(String(key), String(value));
+		}
+
+		return;
+	}
+
+	if (isObject(input)) {
+		for (const [key, value] of Object.entries(input)) {
+			if (value !== undefined) {
+				result.append(key, String(value));
+			}
+		}
+
+		return;
+	}
+
+	const parameters = new URLSearchParams(input);
+	for (const [key, value] of parameters.entries()) {
+		result.append(key, value);
+	}
+};
+
 const appendSearchParameters = (target: SearchParamsOption | undefined, source: SearchParamsOption): URLSearchParams => {
 	const result = new URLSearchParams();
 
 	for (const input of [target, source]) {
-		if (input === undefined) {
-			continue;
-		}
-
-		if (input instanceof URLSearchParams) {
-			for (const [key, value] of input.entries()) {
-				result.append(key, value);
-			}
-		} else if (Array.isArray(input)) {
-			for (const pair of input) {
-				if (!Array.isArray(pair) || pair.length !== 2) {
-					throw new TypeError('Array search parameters must be provided in [[key, value], ...] format');
-				}
-
-				const [key, value] = pair;
-				result.append(String(key), String(value));
-			}
-		} else if (isObject(input)) {
-			for (const [key, value] of Object.entries(input)) {
-				if (value !== undefined) {
-					result.append(key, String(value));
-				}
-			}
-		} else {
-			const parameters = new URLSearchParams(input);
-			for (const [key, value] of parameters.entries()) {
-				result.append(key, value);
-			}
+		if (input !== undefined) {
+			appendSearchParameterInput(result, input);
 		}
 	}
 
@@ -92,75 +104,130 @@ const asMergeRecord = (value: MergeTarget): Record<string, unknown> => {
 	return value;
 };
 
+type MergeState = {
+	headers: KyHeadersInit;
+	hooks: Hooks;
+	searchParameters: SearchParamsOption | undefined;
+	signals: AbortSignal[];
+};
+
+const mergeContextValue = (resultRecord: Record<string, unknown>, value: unknown): Record<string, unknown> => {
+	if (value !== undefined && value !== null && (!isObject(value) || Array.isArray(value))) {
+		throw new TypeError('The `context` option must be an object');
+	}
+
+	const existingContext = isObject(resultRecord['context']) ? resultRecord['context'] : {};
+
+	return {
+		...resultRecord,
+		context: (value === undefined || value === null)
+			? {}
+			: {...existingContext, ...value},
+	};
+};
+
+const mergeSearchParameters = (
+	current: SearchParamsOption | undefined,
+	value: unknown,
+): SearchParamsOption | undefined => {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+
+	const next = value as SearchParamsOption;
+	return current === undefined ? next : appendSearchParameters(current, next);
+};
+
+const mergeRecordEntry = (
+	resultRecord: Record<string, unknown>,
+	key: string,
+	value: unknown,
+	state: MergeState,
+): Record<string, unknown> => {
+	if (key === 'signal' && value instanceof globalThis.AbortSignal) {
+		state.signals.push(value);
+		return resultRecord;
+	}
+
+	if (key === 'context') {
+		return mergeContextValue(resultRecord, value);
+	}
+
+	if (key === 'searchParams') {
+		state.searchParameters = mergeSearchParameters(state.searchParameters, value);
+		return resultRecord;
+	}
+
+	if (isObject(value) && key in resultRecord) {
+		const existingValue = resultRecord[key] as Record<string, unknown>;
+		value = deepMerge<Record<string, unknown>>(existingValue, value as Record<string, unknown>);
+	}
+
+	return {...resultRecord, [key]: value};
+};
+
+const mergeSpecialOptions = (resultRecord: Record<string, unknown>, sourceRecord: Record<string, unknown>, state: MergeState): void => {
+	if (isObject(sourceRecord['hooks'])) {
+		state.hooks = mergeHooks(state.hooks, sourceRecord['hooks'] as Hooks);
+		resultRecord['hooks'] = state.hooks;
+	}
+
+	if (isObject(sourceRecord['headers'])) {
+		state.headers = mergeHeaders(state.headers, sourceRecord['headers'] as KyHeadersInit);
+		resultRecord['headers'] = state.headers;
+	}
+};
+
+const mergeSignalValues = (mergedRecord: Record<string, unknown>, signals: AbortSignal[]): void => {
+	if (signals.length === 0) {
+		return;
+	}
+
+	if (signals.length === 1) {
+		mergedRecord['signal'] = signals[0];
+		return;
+	}
+
+	if (supportsAbortSignal) {
+		mergedRecord['signal'] = AbortSignal.any(signals);
+		return;
+	}
+
+	// When AbortSignal.any is not available, use the last signal
+	// This maintains the previous behavior before signal merging was added
+	// This can be remove when the `supportsAbortSignal` check is removed.`
+	mergedRecord['signal'] = signals.at(-1);
+};
+
 export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
 	let returnValue: MergeTarget = {};
-	let headers: KyHeadersInit = {};
-	let hooks: Hooks = {};
-	let searchParameters: SearchParamsOption | undefined;
-	const signals: AbortSignal[] = [];
+	const state: MergeState = {
+		headers: {},
+		hooks: {},
+		searchParameters: undefined,
+		signals: [],
+	};
 
 	for (const source of sources) {
 		if (Array.isArray(source)) {
 			const current: unknown[] = Array.isArray(returnValue) ? returnValue : [];
 			returnValue = [...current, ...source];
-		} else if (isObject(source)) {
-			const sourceRecord = source as Record<string, unknown>;
-			let resultRecord = asMergeRecord(returnValue);
-
-			for (let [key, value] of Object.entries(sourceRecord)) {
-				// Special handling for AbortSignal instances
-				if (key === 'signal' && value instanceof globalThis.AbortSignal) {
-					signals.push(value);
-					continue;
-				}
-
-				// Special handling for context - shallow merge only
-				if (key === 'context') {
-					if (value !== undefined && value !== null && (!isObject(value) || Array.isArray(value))) {
-						throw new TypeError('The `context` option must be an object');
-					}
-
-					const existingContext = isObject(resultRecord['context']) ? resultRecord['context'] : {};
-					resultRecord = {
-						...resultRecord,
-						context: (value === undefined || value === null)
-							? {}
-							: {...existingContext, ...value},
-					};
-					continue;
-				}
-
-				// Special handling for searchParams
-				if (key === 'searchParams') {
-					if (value === undefined || value === null) {
-						searchParameters = undefined;
-					} else {
-						const next = value as SearchParamsOption;
-						searchParameters = searchParameters === undefined ? next : appendSearchParameters(searchParameters, next);
-					}
-
-					continue;
-				}
-
-				if (isObject(value) && key in resultRecord) {
-					value = deepMerge(resultRecord[key] as Record<string, unknown>, value);
-				}
-
-				resultRecord = {...resultRecord, [key]: value};
-			}
-
-			if (isObject(sourceRecord['hooks'])) {
-				hooks = mergeHooks(hooks, sourceRecord['hooks'] as Hooks);
-				resultRecord['hooks'] = hooks;
-			}
-
-			if (isObject(sourceRecord['headers'])) {
-				headers = mergeHeaders(headers, sourceRecord['headers'] as KyHeadersInit);
-				resultRecord['headers'] = headers;
-			}
-
-			returnValue = resultRecord;
+			continue;
 		}
+
+		if (!isObject(source)) {
+			continue;
+		}
+
+		const sourceRecord = source as Record<string, unknown>;
+		let resultRecord = asMergeRecord(returnValue);
+
+		for (const [key, value] of Object.entries(sourceRecord)) {
+			resultRecord = mergeRecordEntry(resultRecord, key, value, state);
+		}
+
+		mergeSpecialOptions(resultRecord, sourceRecord, state);
+		returnValue = resultRecord;
 	}
 
 	if (Array.isArray(returnValue)) {
@@ -169,22 +236,11 @@ export const deepMerge = <T>(...sources: Array<Partial<T> | undefined>): T => {
 
 	const mergedRecord = asMergeRecord(returnValue);
 
-	if (searchParameters !== undefined) {
-		mergedRecord['searchParams'] = searchParameters;
+	if (state.searchParameters !== undefined) {
+		mergedRecord['searchParams'] = state.searchParameters;
 	}
 
-	if (signals.length > 0) {
-		if (signals.length === 1) {
-			mergedRecord['signal'] = signals[0];
-		} else if (supportsAbortSignal) {
-			mergedRecord['signal'] = AbortSignal.any(signals);
-		} else {
-			// When AbortSignal.any is not available, use the last signal
-			// This maintains the previous behavior before signal merging was added
-			// This can be remove when the `supportsAbortSignal` check is removed.`
-			mergedRecord['signal'] = signals.at(-1);
-		}
-	}
+	mergeSignalValues(mergedRecord, state.signals);
 
 	return mergedRecord as T;
 };
