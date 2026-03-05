@@ -43,22 +43,21 @@ test('method defaults to "GET"', async t => {
 	);
 });
 
-test.failing('custom method remains identical', async t => {
+test('custom method is normalized to uppercase', async t => {
 	const server = await createHttpTestServer(t);
 	server.all('/', (_request, response) => {
 		response.end();
 	});
 
-	t.plan(1);
+	t.plan(2);
 
 	await t.notThrowsAsync(
-		// TODO: Is it correct for this to throw 400 status code?
 		ky(server.url, {
 			method: 'report',
 			hooks: {
 				beforeRequest: [
 					({options}) => {
-						t.is(options.method, 'report');
+						t.is(options.method, 'REPORT');
 					},
 				],
 			},
