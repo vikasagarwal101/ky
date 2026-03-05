@@ -18,8 +18,9 @@ export type ResponsePromise<T = unknown> = {
 	*/
 	bytes: () => Promise<Uint8Array>;
 
-	// TODO: Use `json<T extends JSONValue>(): Promise<T>;` when it's fixed in TS.
-	// See https://github.com/microsoft/TypeScript/issues/15300 and https://github.com/sindresorhus/ky/pull/80
+	// TODO: Use `json<T extends JSONValue>(): Promise<T>;` when TypeScript's fetch typing allows it.
+	// Checked on TypeScript 5.9.3 (2026-03-04): still blocked, so keep this generic unconstrained for now.
+	// Tracking: https://github.com/microsoft/TypeScript/issues/15300 and https://github.com/sindresorhus/ky/pull/80
 	json: {
 		/**
 		Get the response body as JSON.
