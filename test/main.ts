@@ -881,6 +881,20 @@ test('merges searchParams with duplicate keys', async t => {
 	t.false(urlString.includes('[object Object]'), `URL should not contain [object Object], got: ${urlString}`);
 });
 
+test('deepMerge preserves array indices when merging with object', async t => {
+	// Direct test of deepMerge behavior with arrays and objects
+	const {deepMerge} = await import('../source/utils/merge.js');
+
+	// When merging an array first, then an object, the array indices should be preserved
+	const result = deepMerge([1, 2, 3], {foo: 'bar'});
+	t.deepEqual(result, {
+		0: 1,
+		1: 2,
+		2: 3,
+		foo: 'bar',
+	}, 'array indices should be preserved when merging with object');
+});
+
 test('throwHttpErrors option', async t => {
 	const server = await createHttpTestServer(t);
 	server.get('/', (_request, response) => {
