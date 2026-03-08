@@ -12,7 +12,7 @@ import type {
 } from '../types/options.js';
 import {type ResponsePromise} from '../types/ResponsePromise.js';
 import type {StandardSchemaV1} from '../types/standard-schema.js';
-import {streamRequest, streamResponse} from '../utils/body.js';
+import {streamRequest, streamResponse, createTextDecoder} from '../utils/body.js';
 import {mergeHeaders, mergeHooks} from '../utils/merge.js';
 import {normalizeRequestMethod, normalizeRetryOptions} from '../utils/normalize.js';
 import {validateJsonWithSchema} from '../utils/schema.js';
@@ -36,17 +36,7 @@ import {
 const maxErrorResponseBodySize = 10 * 1024 * 1024;
 const prefixUrlRenamedErrorMessage = 'The `prefixUrl` option has been renamed `prefix` in v2 and enhanced to allow slashes in input. See also the new `baseUrl` option for improved flexibility with standard URL resolution: https://github.com/sindresorhus/ky#baseurl';
 
-const createTextDecoder = (contentType: string): TextDecoder => {
-	const match = /;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i.exec(contentType);
-	const charset = match?.[1] ?? match?.[2];
-	if (charset) {
-		try {
-			return new TextDecoder(charset);
-		} catch {}
-	}
 
-	return new TextDecoder();
-};
 
 export class Ky {
 	static create(input: Input, options: Options): ResponsePromise {
