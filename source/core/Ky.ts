@@ -1,7 +1,6 @@
 import {HTTPError} from '../errors/HTTPError.js';
 import {NonError} from '../errors/NonError.js';
 import {ForceRetryError} from '../errors/ForceRetryError.js';
-import {SchemaValidationError} from '../errors/SchemaValidationError.js';
 import {TimeoutError} from '../errors/TimeoutError.js';
 import type {
 	Input,
@@ -16,6 +15,7 @@ import type {StandardSchemaV1} from '../types/standard-schema.js';
 import {streamRequest, streamResponse} from '../utils/body.js';
 import {mergeHeaders, mergeHooks} from '../utils/merge.js';
 import {normalizeRequestMethod, normalizeRetryOptions} from '../utils/normalize.js';
+import {validateJsonWithSchema} from '../utils/schema.js';
 import timeout, {type TimeoutOptions} from '../utils/timeout.js';
 import delay from '../utils/delay.js';
 import {type ObjectEntries} from '../utils/types.js';
@@ -46,36 +46,6 @@ const createTextDecoder = (contentType: string): TextDecoder => {
 	}
 
 	return new TextDecoder();
-};
-
-const validateJsonWithSchema = async (jsonValue: unknown, schema: StandardSchemaV1): Promise<unknown> => {
-	if (
-		(
-			typeof schema !== 'object'
-			&& typeof schema !== 'function'
-		)
-		|| schema === null
-	) {
-		throw new TypeError('The `schema` argument must follow the Standard Schema specification');
-	}
-
-	const standardSchema = schema['~standard'];
-
-	if (
-		typeof standardSchema !== 'object'
-		|| standardSchema === null
-		|| typeof standardSchema.validate !== 'function'
-	) {
-		throw new TypeError('The `schema` argument must follow the Standard Schema specification');
-	}
-
-	const validationResult = await standardSchema.validate(jsonValue);
-
-	if (validationResult.issues) {
-		throw new SchemaValidationError(validationResult.issues);
-	}
-
-	return validationResult.value;
 };
 
 export class Ky {
