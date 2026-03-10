@@ -368,42 +368,62 @@ export class Ky {
 		return maxRetryAfter === undefined ? retryDelay : Math.min(maxRetryAfter, retryDelay);
 	}
 
-	async #calculateRetryDelay(error: unknown) {
-		if (this.#retryCount >= this.#options.retry.limit) {
-			throw error;
+	#handleForcedRetry(error: Error): number | undefined {
+		if (error instanceof ForceRetryError) {
+			return error.customDelay ?? this.#calculateDelay();
 		}
 
-		// Wrap non-Error throws to ensure consistent error handling
-		const errorObject = error instanceof Error ? error : new NonError(error);
+		return undefined;
+	}
 
-		// Handle forced retry from afterResponse hook - skip method check and shouldRetry
-		if (errorObject instanceof ForceRetryError) {
-			return errorObject.customDelay ?? this.#calculateDelay();
+	#isMethodRetriable(): boolean {
+		return this.#options.retry.methods.includes(this.request.method.toLowerCase());
+	}
+
+	async #handleShouldRetry(errorObject: Error, originalError: unknown): Promise<number | undefined> {
+		if (this.#options.retry.shouldRetry === undefined) {
+			return undefined;
 		}
 
-		// Check if method is retriable for non-forced retries
-		if (!this.#options.retry.methods.includes(this.request.method.toLowerCase())) {
-			throw error;
+		const result = await this.#options.retry.shouldRetry({error: errorObject, retryCount: this.#retryCount + 1});
+
+		if (result === false) {
+			throw originalError;
 		}
 
-		// User-provided shouldRetry function takes precedence over default checks (retryOnTimeout, status codes, etc.)
-		if (this.#options.retry.shouldRetry !== undefined) {
-			const result = await this.#options.retry.shouldRetry({error: errorObject, retryCount: this.#retryCount + 1});
-
-			// Strict boolean checking - only exact true/false are handled specially
-			if (result === false) {
-				throw error;
-			}
-
-			if (result === true) {
-				// Force retry - skip all other validation and return delay
-				return this.#calculateDelay();
-			}
-
-			// If undefined or any other value, fall through to default behavior
+		if (result === true) {
+			return this.#calculateDelay();
 		}
 
-		// Default timeout behavior
+		return undefined;
+	}
+
+	#getRetryAfterDelay(error: HTTPError): number | undefined {
+		const retryAfter = error.response.headers.get('Retry-After')
+			?? error.response.headers.get('RateLimit-Reset')
+			?? error.response.headers.get('X-RateLimit-Retry-After') // Symfony-based services
+			?? error.response.headers.get('X-RateLimit-Reset') // GitHub
+			?? error.response.headers.get('X-Rate-Limit-Reset'); // Twitter
+
+		if (!retryAfter || !this.#options.retry.afterStatusCodes.includes(error.response.status)) {
+			return undefined;
+		}
+
+		let after = Number(retryAfter) * 1000;
+		if (Number.isNaN(after)) {
+			after = Date.parse(retryAfter) - Date.now();
+		} else if (after >= Date.parse('2024-01-01')) {
+			after -= Date.now();
+		}
+
+		if (!Number.isFinite(after)) {
+			return this.#clampRetryDelayToMax(this.#calculateDelay());
+		}
+
+		return this.#clampRetryDelayToMax(Math.max(0, after));
+	}
+
+	#handleTimeoutAndDefaultRetry(error: unknown): number {
 		if (isTimeoutError(error) && !this.#options.retry.retryOnTimeout) {
 			throw error;
 		}
@@ -413,28 +433,9 @@ export class Ky {
 				throw error;
 			}
 
-			const retryAfter = error.response.headers.get('Retry-After')
-				?? error.response.headers.get('RateLimit-Reset')
-				?? error.response.headers.get('X-RateLimit-Retry-After') // Symfony-based services
-				?? error.response.headers.get('X-RateLimit-Reset') // GitHub
-				?? error.response.headers.get('X-Rate-Limit-Reset'); // Twitter
-			if (retryAfter && this.#options.retry.afterStatusCodes.includes(error.response.status)) {
-				let after = Number(retryAfter) * 1000;
-				if (Number.isNaN(after)) {
-					after = Date.parse(retryAfter) - Date.now();
-				} else if (after >= Date.parse('2024-01-01')) {
-					// A large number is treated as a timestamp (fixed threshold protects against clock skew)
-					after -= Date.now();
-				}
-
-				if (!Number.isFinite(after)) {
-					return this.#clampRetryDelayToMax(this.#calculateDelay());
-				}
-
-				after = Math.max(0, after);
-
-				// Don't apply jitter when server provides explicit retry timing
-				return this.#clampRetryDelayToMax(after);
+			const retryAfterDelay = this.#getRetryAfterDelay(error);
+			if (retryAfterDelay !== undefined) {
+				return retryAfterDelay;
 			}
 
 			if (error.response.status === 413) {
@@ -443,6 +444,30 @@ export class Ky {
 		}
 
 		return this.#calculateDelay();
+	}
+
+	async #calculateRetryDelay(error: unknown) {
+		if (this.#retryCount >= this.#options.retry.limit) {
+			throw error;
+		}
+
+		const errorObject = error instanceof Error ? error : new NonError(error);
+
+		const forcedRetryDelay = this.#handleForcedRetry(errorObject);
+		if (forcedRetryDelay !== undefined) {
+			return forcedRetryDelay;
+		}
+
+		if (!this.#isMethodRetriable()) {
+			throw error;
+		}
+
+		const shouldRetryDelay = await this.#handleShouldRetry(errorObject, error);
+		if (shouldRetryDelay !== undefined) {
+			return shouldRetryDelay;
+		}
+
+		return this.#handleTimeoutAndDefaultRetry(error);
 	}
 
 	#decorateResponse(response: Response): Response {
