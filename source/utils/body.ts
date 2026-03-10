@@ -1,6 +1,25 @@
 import type {Options} from '../types/options.js';
 import {usualFormBoundarySize} from '../core/constants.js';
 
+/**
+ * Creates a TextDecoder instance with the charset extracted from the content-type header.
+ * Falls back to the default decoder if the charset is invalid or not specified.
+ *
+ * @param contentType - The content-type header value to extract charset from
+ * @returns A TextDecoder instance configured with the extracted charset or default decoder
+ */
+export const createTextDecoder = (contentType: string): TextDecoder => {
+	const match = /;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i.exec(contentType);
+	const charset = match?.[1] ?? match?.[2];
+	if (charset) {
+		try {
+			return new TextDecoder(charset);
+		} catch {}
+	}
+
+	return new TextDecoder();
+};
+
 // eslint-disable-next-line @typescript-eslint/no-restricted-types
 export const getBodySize = (body?: BodyInit | null): number => {
 	if (!body) {
