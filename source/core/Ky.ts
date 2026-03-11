@@ -36,8 +36,6 @@ import {
 const maxErrorResponseBodySize = 10 * 1024 * 1024;
 const prefixUrlRenamedErrorMessage = 'The `prefixUrl` option has been renamed `prefix` in v2 and enhanced to allow slashes in input. See also the new `baseUrl` option for improved flexibility with standard URL resolution: https://github.com/sindresorhus/ky#baseurl';
 
-
-
 export class Ky {
 	static create(input: Input, options: Options): ResponsePromise {
 		const ky = new Ky(input, options);
