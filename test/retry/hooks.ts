@@ -11,7 +11,9 @@ test('shouldRetry: returns true cannot exceed total timeout budget', async t => 
 	server.get('/', async (_request, response) => {
 		requestCount++;
 		// Delay longer than timeout to trigger timeout
-		await new Promise(resolve => setTimeout(resolve, 1000));
+		await new Promise(resolve => {
+			void setTimeout(resolve, 1000);
+		});
 		response.end(fixture);
 	});
 
@@ -181,7 +183,9 @@ test('shouldRetry: works with TimeoutError', async t => {
 	server.get('/', async (_request, response) => {
 		requestCount++;
 		// Delay longer than timeout to trigger timeout
-		await new Promise(resolve => setTimeout(resolve, 1000));
+		await new Promise(resolve => {
+			void setTimeout(resolve, 1000);
+		});
 		response.end(fixture);
 	});
 
@@ -212,7 +216,9 @@ test('shouldRetry: precedence over retryOnTimeout', async t => {
 	server.get('/', async (_request, response) => {
 		requestCount++;
 		// Delay longer than timeout to trigger timeout
-		await new Promise(resolve => setTimeout(resolve, 1000));
+		await new Promise(resolve => {
+			void setTimeout(resolve, 1000);
+		});
 		response.end(fixture);
 	});
 
