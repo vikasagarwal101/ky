@@ -396,12 +396,27 @@ export class Ky {
 		return undefined;
 	}
 
+	#getRetryAfterHeader(error: HTTPError): string | undefined {
+		const headers = [
+			'Retry-After',
+			'RateLimit-Reset',
+			'X-RateLimit-Retry-After', // Symfony-based services
+			'X-RateLimit-Reset', // GitHub
+			'X-Rate-Limit-Reset', // Twitter
+		];
+
+		for (const header of headers) {
+			const value = error.response.headers.get(header);
+			if (value) {
+				return value;
+			}
+		}
+
+		return undefined;
+	}
+
 	#getRetryAfterDelay(error: HTTPError): number | undefined {
-		const retryAfter = error.response.headers.get('Retry-After')
-			?? error.response.headers.get('RateLimit-Reset')
-			?? error.response.headers.get('X-RateLimit-Retry-After') // Symfony-based services
-			?? error.response.headers.get('X-RateLimit-Reset') // GitHub
-			?? error.response.headers.get('X-Rate-Limit-Reset'); // Twitter
+		const retryAfter = this.#getRetryAfterHeader(error);
 
 		if (!retryAfter || !this.#options.retry.afterStatusCodes.includes(error.response.status)) {
 			return undefined;
