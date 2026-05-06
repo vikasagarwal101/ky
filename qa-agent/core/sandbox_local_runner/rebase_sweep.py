@@ -369,6 +369,10 @@ def sweep_rebase(
             result["skipped"].append({"pr_number": pr_number, "reason": "already-conflict-marked"})
             continue
 
+        # Detect pre-existing dirty state (stuck temporarily_unreachable PRs)
+        merge_state = str(pr.get("mergeStateStatus") or "").upper()
+        pre_existing_dirty = merge_state in ("DIRTY", "UNKNOWN", "BEHIND")
+
         local_branch = f"rebase-sweep-{pr_number}"
 
         _append_text(log_file, f"rebase-attempt: pr=#{pr_number} branch={head_branch}")
@@ -381,6 +385,12 @@ def sweep_rebase(
         )
 
         if success:
+            # Guard: skip if new_head_sha is empty (rev-parse failed after clean rebase)
+            if not detail:
+                _append_text(log_file, f"rebase-skip: pr=#{pr_number} empty-HEAD-after-rebase")
+                result["skipped"].append({"pr_number": pr_number, "reason": "empty-HEAD-after-rebase"})
+                continue
+
             pushed = _force_push_rebased(
                 local_branch=local_branch,
                 remote_branch=head_branch,
@@ -388,12 +398,14 @@ def sweep_rebase(
                 repo_path=repo_path,
                 log_file=log_file,
                 dry_run=dry_run,
+                pre_existing_dirty=pre_existing_dirty,
             )
             if pushed:
                 result["rebased"].append({
                     "pr_number": pr_number,
                     "branch": head_branch,
                     "new_head": detail[:12],
+                    "pre_existing_dirty": pre_existing_dirty,
                 })
             else:
                 result["skipped"].append({
@@ -428,6 +440,9 @@ def sweep_rebase(
                     log_file,
                     f"rebase-fail: pr=#{pr_number} error={detail[:200]}",
                 )
+
+        # Stagger: small gap between force-pushes for verify windows
+        time.sleep(2)
 
     _append_text(
         log_file,
