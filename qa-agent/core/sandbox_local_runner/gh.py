@@ -204,7 +204,7 @@ def fetch_open_prs_for_merge(repo_slug: str, cwd: Path) -> List[Dict[str, Any]]:
             '--limit',
             '200',
             '--json',
-            'number,url,title,state,isDraft,createdAt,headRefName',
+            'number,url,title,state,isDraft,createdAt,headRefName,baseRefName',
         ],
         cwd=cwd,
     )

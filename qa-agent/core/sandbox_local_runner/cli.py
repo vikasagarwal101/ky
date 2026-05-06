@@ -28,6 +28,7 @@ from .gh import (
     create_or_update_github_issue, create_or_update_github_pr,
     fetch_github_live_counts,
 )
+from .rebase_sweep import sweep_rebase
 from .orchestrator import (
     build_active_cycle_command, build_issue_cycle_command, build_pr_cycle_command,
     build_merge_cycle_command, build_orchestrated_cycle_command, build_refactor_cycle_command, build_reconcile_only_command,
@@ -402,6 +403,10 @@ def main() -> int:
     p.add_argument('--staleness-threshold-seconds', type=int, default=DEFAULT_STALENESS_THRESHOLD_SECONDS)
     p.add_argument('--auto-merge-sandbox', action='store_true', default=False)
     p.add_argument('--merge-cooldown-minutes', type=int, default=30)
+    p.add_argument('--auto-rebase-enabled', action='store_true', default=False,
+                   help='Enable post-merge rebase sweep across sibling PRs')
+    p.add_argument('--rebase-max-prs', type=int, default=5,
+                   help='Max sibling PRs to rebase in one sweep')
     p.add_argument('--max-queue-items', type=int, default=None,
                     help='Maximum number of refactor queue items to process per run (default: all approved)')
     p.add_argument('--auto-approve', action='store_true', default=False,
@@ -1583,6 +1588,32 @@ def main() -> int:
                         issue_github = issue.get('github', {}) if isinstance(issue.get('github'), dict) else {}
                         if int(issue_github.get('pr_number') or 0) == pr_number:
                             set_issue_status(issue, 'resolved_merged', f'PR merged: {pr_url or pr_number}')
+
+                    # Post-merge rebase sweep
+                    if args.auto_rebase_enabled:
+                        _append_text(log_file, 'auto-rebase: starting sibling sweep')
+                        try:
+                            base_branch = str(pr.get('baseRefName', 'main'))
+                            rebase_result = sweep_rebase(
+                                repo_path=repo_path,
+                                gh_repo_slug=gh_repo_slug,
+                                merged_pr_number=pr_number,
+                                base_branch=base_branch,
+                                log_file=log_file,
+                                dry_run=args.dry_run,
+                                max_prs=args.rebase_max_prs,
+                            )
+                            for r in rebase_result.get('rebased', []):
+                                _append_text(log_file, f'rebase-ok: pr=#{r["pr_number"]}')
+                            for c in rebase_result.get('conflicted', []):
+                                _append_text(log_file, f'rebase-conflict: pr=#{c["pr_number"]} files={c["files"]}')
+                                blocked_reasons.append(
+                                    f'rebase-conflict: pr=#{c["pr_number"]} files={", ".join(c["files"])}'
+                                )
+                            for s in rebase_result.get('skipped', []):
+                                _append_text(log_file, f'rebase-skip: pr=#{s["pr_number"]} reason={s["reason"]}')
+                        except Exception as exc:
+                            _append_text(log_file, f'auto-rebase-error: {exc}')
                     break
                 else:
                     branch = str(pr.get('headRefName') or '')

@@ -196,6 +196,10 @@ class RunEngine:
             args.append('--live-github-actions')
         if config.github.get('auto_merge', False):
             args.append('--auto-merge-sandbox')
+        if config.github.get('auto_rebase', {}).get('enabled', True):
+            args.append('--auto-rebase-enabled')
+            rebase_max = config.github['auto_rebase'].get('max_prs_per_sweep', 5)
+            args.extend(['--rebase-max-prs', str(rebase_max)])
 
         # Baseline checks (per-repo validation commands)
         if config.baseline_checks:
