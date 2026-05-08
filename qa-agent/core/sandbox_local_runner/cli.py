@@ -377,7 +377,7 @@ def main() -> int:
     p.add_argument('--reconcile-only', action='store_true', default=False)
     p.add_argument(
         '--run-phase',
-        choices=['issue-cycle', 'pr-cycle', 'merge-cycle', 'refactor-cycle', 'orchestrated', 'verify-only', 'detect-only', 'e2e', 'docs-index'],
+        choices=['issue-cycle', 'pr-cycle', 'merge-cycle', 'refactor-cycle', 'orchestrated', 'verify-only', 'detect-only', 'e2e', 'docs-index', 'clean-prs'],
         default='orchestrated',
     )
 
@@ -403,10 +403,14 @@ def main() -> int:
     p.add_argument('--staleness-threshold-seconds', type=int, default=DEFAULT_STALENESS_THRESHOLD_SECONDS)
     p.add_argument('--auto-merge-sandbox', action='store_true', default=False)
     p.add_argument('--merge-cooldown-minutes', type=int, default=30)
+    p.add_argument('--regression-check', action='store_true', default=False,
+                   help='Enable regression detection before merging (checks test deletions, export changes, lint regressions)')
     p.add_argument('--auto-rebase-enabled', action='store_true', default=False,
                    help='Enable post-merge rebase sweep across sibling PRs')
     p.add_argument('--rebase-max-prs', type=int, default=5,
                    help='Max sibling PRs to rebase in one sweep')
+    p.add_argument('--rebase-stats-file', type=Path, default=None,
+                   help='Path to rebase telemetry JSONL (default: state/rebase_stats.jsonl)')
     p.add_argument('--max-queue-items', type=int, default=None,
                     help='Maximum number of refactor queue items to process per run (default: all approved)')
     p.add_argument('--auto-approve', action='store_true', default=False,
@@ -436,6 +440,7 @@ def main() -> int:
     p.add_argument('--review-feedback', default='')
     p.add_argument('--log-lesson', dest='log_lesson', default='', help='Manual lesson entry to append to LESSONS_LOG.md')
     p.add_argument('--lessons-file', default=str(DEFAULT_LESSONS_LOG))
+    p.add_argument('--tune-override', default='', help='Info flag: auto-tune overrides applied this cycle (e.g. max_prs_per_run=1)')
 
     # Batch PR engine (Phase 1)
     p.add_argument('--batch-pr-enabled', action='store_true', default=True,
@@ -449,6 +454,8 @@ def main() -> int:
     p.add_argument('--no-batch-pr-split-on-failure', dest='batch_pr_split_on_failure',
                    action='store_false', default=True,
                    help='Do not split batches on fix failures')
+    p.add_argument('--batch-dedup-hours', type=int, default=24,
+                   help='Max age (hours) for existing batch PRs to be considered duplicates (default: 24)')
 
     args = p.parse_args()
 
@@ -552,6 +559,25 @@ def main() -> int:
             log_file,
             f'refactor-cycle: done processed={processed} approved={approved} '
             f'pending={pending} failed={failed}',
+        )
+        return 0
+
+    if args.run_phase == 'clean-prs':
+        from .clean_prs import clean_stale_prs
+        _slug_owner, _slug_name = parse_github_repo(get_origin_url(repo_path))
+        _repo_slug = f'{_slug_owner}/{_slug_name}' if _slug_owner and _slug_name else ''
+        _append_text(log_file, 'clean-prs: starting')
+        result = clean_stale_prs(
+            repo_slug=_repo_slug,
+            cwd=repo_path,
+            log_file=log_file,
+            dry_run=args.dry_run,
+            stale_hours=getattr(args, 'stale_pr_hours', 48),
+            dedup_window=getattr(args, 'stale_dedup_window', 24),
+        )
+        print(
+            f'[DONE] clean-prs closed={result["closed"]} '
+            f'duplicates={result["duplicates"]} stale={result["stale"]}'
         )
         return 0
 
@@ -677,6 +703,9 @@ def main() -> int:
     fixes_failed_verification = 0
     issues_escalated_max_retries = 0
     created_prs = 0
+    claude_invocations = 0
+    opencode_invocations = 0
+    deterministic_invocations = 0
     merge_attempts = 0
     merges_succeeded = 0
     merges_failed = 0
@@ -818,11 +847,17 @@ def main() -> int:
                 findings=eligible_findings,
                 confidence_threshold=args.issue_confidence_threshold,
                 max_issues_per_run=1,
+                cycle_signals_path=AGENT_ROOT / 'state' / 'cycle_signals.json',
             )
             if not batch:
                 break
 
             for issue in batch:
+                # Skip cross-cycle suppressed entries
+                if issue.get('issue_id') == 'SUPPRESSED':
+                    suppressed_reason = issue.get('reason', 'suppressed')
+                    _append_text(log_file, f'suppressed-cross-cycle: finding={issue["finding_id"]} rule={issue.get("rule","?")} reason={suppressed_reason}')
+                    continue
                 if args.live_github_actions:
                     issue_finding = finding_from_issue_record(issue)
                     if issue_finding is not None:
@@ -1173,6 +1208,11 @@ def main() -> int:
                     finding.rule in CLAUDE_REQUIRED_RULES or
                     is_llm_fixable
                 )
+                # Track model invocation for cost tracking
+                if use_claude_engine:
+                    claude_invocations += 1
+                else:
+                    deterministic_invocations += 1
                 # Store prompt hint for LLM-fixable rules
                 extra_prompt = llm_rules.get(finding.rule, {}).get('prompt_hint') if is_llm_fixable else None
 
@@ -1186,10 +1226,6 @@ def main() -> int:
                         max_files_changed=args.max_files_changed,
                         max_loc_diff=args.max_loc_diff,
                         log_file=log_file,
-                        findings_file=findings_file,    # NEW
-                        lessons_file=lessons_file,      # NEW
-                        repo_path=repo_path,            # NEW (Phase 0 mnemo integration)
-                        extra_prompt=extra_prompt,
                     )
                     if rc != 0:
                         run_status = 'fix-failed-verification:claude-command-failed'
@@ -1576,6 +1612,25 @@ def main() -> int:
                 if not check_health.get('has_checks', False):
                     _append_text(log_file, f'merge-caution: pr=#{pr_number} no checks found; proceeding')
 
+                # Regression check: compare PR branch against base before merge
+                if getattr(args, 'regression_check', False):
+                    from .regression import check_regressions
+                    head_ref = str(pr.get('headRefName', ''))
+                    base_ref = str(pr.get('baseRefName', 'main'))
+                    if head_ref:
+                        _append_text(log_file, f'regression: checking PR #{pr_number} ({head_ref} vs {base_ref})')
+                        # Fetch PR branch locally for comparison
+                        run_no_capture(['git', 'fetch', 'origin', head_ref], cwd=repo_path)
+                        regression_findings = check_regressions(
+                            repo_path, f'origin/{base_ref}', f'origin/{head_ref}', log_file,
+                        )
+                        if regression_findings:
+                            detail = f'regression: {len(regression_findings)} finding(s) detected — blocking merge'
+                            merges_failed += 1
+                            blocked_reasons.append(detail)
+                            _append_text(log_file, detail)
+                            continue
+
                 merged, merge_reason = merge_pr(gh_repo_slug, pr_number, dry_run=args.dry_run, cwd=repo_path)
                 if merged:
                     merges_succeeded += 1
@@ -1594,6 +1649,7 @@ def main() -> int:
                         _append_text(log_file, 'auto-rebase: starting sibling sweep')
                         try:
                             base_branch = str(pr.get('baseRefName', 'main'))
+                            rebase_stats_file = getattr(args, 'rebase_stats_file', None) or (AGENT_ROOT / 'state' / 'rebase_stats.jsonl')
                             rebase_result = sweep_rebase(
                                 repo_path=repo_path,
                                 gh_repo_slug=gh_repo_slug,
@@ -1602,6 +1658,7 @@ def main() -> int:
                                 log_file=log_file,
                                 dry_run=args.dry_run,
                                 max_prs=args.rebase_max_prs,
+                                rebase_stats_file=rebase_stats_file,
                             )
                             for r in rebase_result.get('rebased', []):
                                 _append_text(log_file, f'rebase-ok: pr=#{r["pr_number"]}')
@@ -1687,6 +1744,8 @@ def main() -> int:
             'merged_pr_urls': merged_pr_urls,
             'blocked_events': len(blocked_reasons),
             'blocked_reasons': blocked_reasons,
+            'claude_invocations': claude_invocations,
+            'deterministic_invocations': deterministic_invocations,
         },
     )
 
@@ -1695,7 +1754,8 @@ def main() -> int:
         f'fix_attempts={fix_attempts} fixes_verified={fixes_verified} '
         f'fixes_failed_verification={fixes_failed_verification} prs_created={created_prs} '
         f'issues_escalated_max_retries={issues_escalated_max_retries} '
-        f'merges={merges_succeeded}/{merge_attempts}'
+        f'merges={merges_succeeded}/{merge_attempts} '
+        f'cost: claude={claude_invocations} deterministic={deterministic_invocations}'
     )
     _append_text(
         log_file,
@@ -1703,7 +1763,8 @@ def main() -> int:
         f'fix_attempts={fix_attempts} fixes_verified={fixes_verified} '
         f'fixes_failed_verification={fixes_failed_verification} prs={created_prs} '
         f'issues_escalated_max_retries={issues_escalated_max_retries} '
-        f'merges={merges_succeeded}/{merge_attempts}',
+        f'merges={merges_succeeded}/{merge_attempts} '
+        f'cost: claude={claude_invocations} deterministic={deterministic_invocations}',
     )
 
     # Auto-log lesson at end of active cycles (not reconcile-only or verify-only)
@@ -1734,6 +1795,25 @@ def main() -> int:
             what_changed='; '.join(changed_parts) if changed_parts else '',
             what_worked='; '.join(worked_parts) if worked_parts else '',
         )
+
+    # Escalation checks — only for merge-cycle and pr-cycle
+    if args.run_phase in ('merge-cycle', 'pr-cycle'):
+        from .escalation import run_escalation_checks
+        escalation_file = AGENT_ROOT / 'state' / 'escalation_log.jsonl'
+        rebase_stats_file = AGENT_ROOT / 'state' / 'rebase_stats.jsonl'
+        escalation_findings = run_escalation_checks(
+            run_log_file=log_file,
+            escalation_file=escalation_file,
+            issues_data=issues_data,
+            merges_failed=merges_failed,
+            merges_succeeded=merges_succeeded,
+            rebase_stats_file=rebase_stats_file,
+        )
+        if escalation_findings:
+            _append_text(log_file, f'escalation: {len(escalation_findings)} pattern(s) detected')
+            for ef in escalation_findings:
+                _append_text(log_file, f'  escalation-{ef["type"]}: {ef["detail"]}')
+
     return 0
 
 
