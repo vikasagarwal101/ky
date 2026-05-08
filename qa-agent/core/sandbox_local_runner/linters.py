@@ -372,6 +372,13 @@ def discover_python_linter_findings(repo_path: Path, log_file: Path) -> List[Fin
             if rule_name == 'ruff-c408':
                 safe_to_autofix = False
 
+            # Suppress ruff-c408 findings in Django migration files — these use dict()
+            # for runtime model field resolution and must NEVER be rewritten.
+            if rule_name == 'ruff-c408':
+                file_rel = str(result.get('filename', ''))
+                if '/migrations/' in file_rel:
+                    continue
+
             location = result.get('location', {})
             line_num = int(location.get('row', 0))
 
