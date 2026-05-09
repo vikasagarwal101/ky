@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QA Agent CLI entry point."""
+"""Ceph CLI — Autonomous repo health. Silence from the depths."""
 
 import argparse
 import json
@@ -183,7 +183,7 @@ def cmd_status(args):
             print(json.dumps({'repo': repo.to_dict(), 'recent_runs': recent_runs}, indent=2))
             return 0
 
-        print(f"QA Agent Status: {repo.config.name}")
+        print(f"Ceph — {repo.config.name}: {status}")
         print("=" * 60)
         print(f"Status: {_status_icon(repo.status)} {repo.status.value}")
         print(f"Health: {_health_icon(repo.current_health_score)} {repo.current_health_score:.1f}/100")
@@ -216,7 +216,7 @@ def cmd_status(args):
 
     repos = registry.list_all()
     if args.format == 'whatsapp':
-        lines = [f"QA Agent | repos: {len(repos)}"]
+        lines = [f"Ceph (qa-agent) | repos: {len(repos)}"]
         for repo in repos:
             lines.append(f"{_status_icon(repo.status)} {repo.config.name} | {_health_icon(repo.current_health_score)} {repo.current_health_score:.1f} | findings {repo.current_findings_count}")
         print('\n'.join(lines))
@@ -225,7 +225,7 @@ def cmd_status(args):
         print(json.dumps({'version': __version__, 'workspace': str(config.workspace), 'repos': [r.to_dict() for r in repos]}, indent=2))
         return 0
 
-    print("QA Agent Status")
+    print("Ceph — Status")
     print("=" * 60)
     print(f"Version: {__version__}")
     print(f"Workspace: {config.workspace}")
@@ -251,7 +251,7 @@ def cmd_repos_list(args):
     if not repos:
         print("No repos configured.")
         print("\nTo onboard a new repo, run:")
-        print("  qa-agent onboard --repo /path/to/repo")
+        print("  ceph onboard --repo /path/to/repo")
         return 0
     
     print("Configured Repositories:")
@@ -503,9 +503,9 @@ def cmd_onboard(args):
                 print(f"   - {item}")
         
         print(f"\n🚀 Next steps:")
-        print(f"   Preflight: qa-agent preflight --repo {repo_path}")
-        print(f"   Run: qa-agent run --repo {result.repo.config.name} --phase issue-cycle --dry-run")
-        print(f"   Status: qa-agent repos show {result.repo.config.name}")
+        print(f"   Preflight: ceph preflight --repo {repo_path}")
+        print(f"   Run: ceph run --repo {result.repo.config.name} --phase issue-cycle --dry-run")
+        print(f"   Status: ceph repos show {result.repo.config.name}")
         
         return 0
         
@@ -913,7 +913,7 @@ def cmd_doctor(args):
         return 0 if all(c['ok'] for c in checks) else 1
 
     if args.format == 'whatsapp':
-        lines = ['QA Agent Doctor']
+        lines = ['Ceph — Doctor']
         for check in checks:
             lines.append(f"{'✅' if check['ok'] else '❌'} {check['name']}: {check['detail']}")
         for report in repo_reports:
@@ -933,7 +933,7 @@ def cmd_doctor(args):
         print('\n'.join(lines))
         return 0 if all(c['ok'] for c in checks) else 1
 
-    print('QA Agent Doctor')
+    print('Ceph — Doctor')
     print('=' * 60)
     for check in checks:
         print(f"{'OK' if check['ok'] else 'FAIL':<5} {check['name']}: {check['detail']}")
@@ -967,10 +967,94 @@ def cmd_doctor(args):
     return 0 if all(c['ok'] for c in checks) else 1
 
 
+def cmd_add_repo(args):
+    """Clone a GitHub repo and onboard in one step."""
+    url = args.url.rstrip('/')
+
+    # Resolve owner/repo from URL
+    if 'github.com/' in url:
+        repo_path_part = url.split('github.com/')[-1]
+        # Strip optional .git suffix
+        repo_path_part = repo_path_part.replace('.git', '')
+    else:
+        print(f"Error: Not a GitHub URL: {url}")
+        return 1
+
+    local_name = args.name or repo_path_part.split('/')[-1]
+    root = Path(__file__).resolve().parents[1]
+    clone_dir = root / 'repos' / local_name
+
+    if clone_dir.exists():
+        print(f"→ Repo directory already exists: {clone_dir}")
+    else:
+        print(f"→ Cloning {url} to {clone_dir}...")
+        r = subprocess.run(['git', 'clone', url, str(clone_dir)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"✗ Clone failed: {r.stderr.strip()[:300]}")
+            return 1
+        print(f"  ✓ Cloned successfully")
+
+    # Run onboard
+    print(f"→ Onboarding {local_name}...")
+    config = ConfigManager()
+    registry = RepoRegistry(config)
+    health = HealthEngine()
+    state = StateManager(config.repos_dir)
+    plugins = PluginLoader(config.plugins_dir)
+    engine = OnboardEngine(registry, plugins, health, state)
+
+    try:
+        result = engine.onboard(
+            clone_dir,
+            OnboardOptions(
+                name=local_name,
+                language=None,
+                template=None,
+                capture_baseline=not args.skip_baseline,
+                mode=args.mode,
+                profile=args.profile,
+                allow_dirty_worktree=False,
+            )
+        )
+    except Exception as e:
+        print(f"✗ Onboarding failed: {e}")
+        return 1
+
+    print(f"  ✓ Onboarded: {result.repo.config.name}")
+    print(f"  ✓ Language: {result.language.name}")
+    print(f"  ✓ Plugin: {result.plugin_id}")
+    print(f"  ✓ Safety: {args.mode} / {args.profile}")
+
+    # Install cron if not skipped
+    if not args.no_cron:
+        print(f"→ Installing cron schedule...")
+        safety_mode = args.mode
+        env = {
+            **os.environ,
+            'ISSUE_SCHEDULE': '0 */4 * * *',
+            'PR_SCHEDULE': '0 */6 * * *',
+            'REVIEW_SCHEDULE': '30 * * * *',
+            'MERGE_SCHEDULE': '0 6,18 * * *',
+            'INCLUDE_PR': '1' if safety_mode in {'pr', 'merge'} else '0',
+            'INCLUDE_REVIEW': '1',
+            'INCLUDE_MERGE': '1' if safety_mode == 'merge' else '0',
+        }
+        script = root / 'scripts' / 'install-cron.sh'
+        if script.exists():
+            r = subprocess.run([str(script), local_name], env=env, capture_output=True, text=True)
+            output = (r.stdout or '') + (f'\n{r.stderr}' if r.stderr else '')
+            print(f"  {'✓ Cron installed' if r.returncode == 0 else f'✗ Cron install failed: {output.strip()[:200]}'}")
+        else:
+            print(f"  ⚠ installer not found: {script}")
+
+    print(f"\n✅ {local_name} ready. Run: ceph status --repo {local_name}")
+    return 0
+
+
 def cmd_init(args):
     """Interactive first-run setup wizard."""
     print("=" * 52)
-    print(" QA Agent — First-Run Setup")
+    print(" Ceph — First-Run Setup")
     print("=" * 52)
 
     # 1. Check prerequisites
@@ -1017,7 +1101,7 @@ def cmd_init(args):
     while repo_path is None:
         choice = input("\n  Your choice [1/2/q]: ").strip()
         if choice.lower() == 'q':
-            print("  Exiting. Run './qa-agent onboard' when ready.")
+            print("  Exiting. Run 'ceph onboard' when ready.")
             return 0
         if choice == '1':
             p = input("  Local path: ").strip()
@@ -1114,17 +1198,17 @@ def cmd_init(args):
         print("\n  Skipping cron install.")
 
     print("\n" + "=" * 52)
-    print(f" QA Agent setup complete for '{repo_name}'")
+    print(f" Ceph setup complete for '{repo_name}'")
     print("=" * 52)
     print(f"\n  Next steps:")
-    print(f"    ./qa-agent status --repo {repo_name}")
-    print(f"    ./qa-agent run --repo {repo_name} --phase issue-cycle --dry-run")
-    print(f"\n  See ./qa-agent --help for all commands.")
+    print(f"    ceph status --repo {repo_name}")
+    print(f"    ceph run --repo {repo_name} --phase issue-cycle --dry-run")
+    print(f"\n  See ceph --help for all commands.")
     return 0
 
 
 def cmd_update(args):
-    """Self-update qa-agent to the latest version."""
+    """Self-update Ceph (qa-agent) to the latest version."""
     root = Path(__file__).resolve().parents[1]
 
     # Detect install method
@@ -1234,6 +1318,15 @@ def main():
     doctor_parser.add_argument('--repo', help='Repository name')
     doctor_parser.add_argument('--format', choices=['text', 'whatsapp', 'json'], default='text', help='Output format')
 
+    # add-repo
+    add_repo_parser = subparsers.add_parser('add-repo', help='Clone a GitHub repo and onboard in one step')
+    add_repo_parser.add_argument('--url', required=True, help='GitHub repository URL (https://github.com/owner/repo)')
+    add_repo_parser.add_argument('--name', help='Name for this repo (default: auto-detected from URL)')
+    add_repo_parser.add_argument('--mode', choices=['observe', 'issue-only', 'pr', 'merge'], default='observe', help='Safety mode')
+    add_repo_parser.add_argument('--profile', choices=['conservative', 'balanced', 'aggressive'], default='conservative', help='Safety profile')
+    add_repo_parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline capture')
+    add_repo_parser.add_argument('--no-cron', action='store_true', help='Skip cron installation')
+
     # install-cron
     cron_parser = subparsers.add_parser('install-cron', help='Install host cron schedule for a repo')
     cron_parser.add_argument('--repo', required=True, help='Repository name')
@@ -1280,6 +1373,8 @@ def main():
         return cmd_report(args)
     elif args.command == 'doctor':
         return cmd_doctor(args)
+    elif args.command == 'add-repo':
+        return cmd_add_repo(args)
     elif args.command == 'install-cron':
         return cmd_install_cron(args)
     elif args.command == 'heal':

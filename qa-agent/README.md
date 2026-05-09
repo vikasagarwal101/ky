@@ -1,8 +1,20 @@
-# QA Agent
+# Ceph — The Cleaner
 
-**Standalone autonomous repository QA**
+**Autonomous repository health. Silence from the depths.**
 
-Version: 2.5.0
+Version: 2.5.0 | Codebase: `qa-agent` | [waterworkshq/ceph](https://github.com/waterworkshq/ceph)
+
+---
+
+## Why this exists
+
+I built this because noise compounds. Every repo accumulates finding echoes — lint warnings that cycle, stale PRs that never close, migration artifacts that reappear after every purge. The Octopus couldn't keep up. So I built the echo killer.
+
+Ceph dives into your repos, surfaces every finding, silences the noise, and surfaces clean — or surfaces nothing at all. No dedup saturation, no zombie cycles, no escalation noise. Just clean, quiet, and repeatable.
+
+This is the second product from Waterworks HQ. If Orcy hunts as a pod, Ceph cleans in the depths — diving where the noise lives and not surfacing until it's gone.
+
+---
 
 ## Quick Start
 
@@ -13,28 +25,28 @@ cd qa-agent
 ./qa-agent init          # interactive setup wizard
 
 # Or with npm (once published)
-npm install -g qa-agent
-qa-agent init
+npm install -g ceph
+ceph init
 ```
 
 ## What it is
 
-`qa-agent` is the host-side control plane for autonomous repository QA.
+`ceph` (codebase `qa-agent`) is the host-side control plane for autonomous repository health.
 
 It is designed to:
-- discover issues
-- score repository health
-- queue or apply fixes
-- create/update PRs
-- track history and regressions
-- run independently of OpenClaw’s isolated-session cron path
+- dive into repos and discover all findings
+- score repository health across granular dimensions
+- queue or apply fixes from multiple backends
+- create and update PRs autonomously
+- track history and regressions over time
+- run independently of any platform dependency
 
-For `ky`, the intended ownership is now:
-- **execution:** `qa-agent` + `sandbox_local_runner.py`
+For `ky`, the current setup:
+- **execution:** `ceph` runner + `sandbox_local_runner.py`
 - **scheduling:** host `crontab`
 - **fix backends:** local CLI tools (`claude`, `opencode`) with deterministic fallback
-- **state:** `qa-agent/repos/<repo>/...`
-- **records / reporting mirror:** deterministic scripts writing to `~/Obsidian/Logs/...`
+- **state:** `repos/<repo>/...`
+- **records / reporting:** deterministic scripts writing to `~/Obsidian/Logs/...`
 
 ---
 
