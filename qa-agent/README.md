@@ -34,10 +34,11 @@ ceph init
 `ceph` (codebase `qa-agent`) is the host-side control plane for autonomous repository health.
 
 It is designed to:
-- dive into repos and discover all findings
+- dive into tanks and scan every finding
 - score repository health across granular dimensions
+- ink findings into PRs with full audit trails
 - queue or apply fixes from multiple backends
-- create and update PRs autonomously
+- duster mode for safe dry-runs
 - track history and regressions over time
 - run independently of any platform dependency
 
@@ -45,7 +46,7 @@ For `ky`, the current setup:
 - **execution:** `ceph` runner + `sandbox_local_runner.py`
 - **scheduling:** host `crontab`
 - **fix backends:** local CLI tools (`claude`, `opencode`) with deterministic fallback
-- **state:** `repos/<repo>/...`
+- **state:** `repos/<tank>/...`
 - **records / reporting:** deterministic scripts writing to `~/Obsidian/Logs/...`
 
 ---
