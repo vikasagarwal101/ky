@@ -172,6 +172,14 @@ Circular badge with:
 - "ceph" wordmark at bottom, same arc format as Orcy
 - Ink cloud behind the octopus — subtle, like it's already vanished
 
+## Domain
+
+Ceph will get its own domain (e.g. ceph.dev) once the codebase is mature enough to stand alone.
+
+**Timeline:** maturity-gated, not date-gated. Same model as Orcy's launch.
+
+Until then, Ceph lives in the workspace repo as the `qa-agent` codebase, ready to be extracted when the code earns the right to surface on its own.
+
 **File location:** `design_assets/ceph-logo.svg` (create when ready)
 
 ---
