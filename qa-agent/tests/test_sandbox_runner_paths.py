@@ -93,7 +93,6 @@ def test_apply_claude_fix_cleans_up_prompt_file(tmp_path, monkeypatch):
     monkeypatch.setattr(slr.apply_claude_fix.__globals__['subprocess'], 'run', fake_run)
     rc, output, prompt_file = slr.apply_claude_fix(
         worktree_path=worktree,
-        repo_path=main_repo,
         finding=finding,
         baseline_checks={'baseline': ['pytest', '-q']},
         target_checks={},

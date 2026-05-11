@@ -5,13 +5,23 @@ repos:
   name: qa-sandbox
   path: /home/vikas/.openclaw/workspace/qa-sandbox-repo
 - enabled: true
-  id: repo-ky
-  language: typescript
-  name: ky
-  path: /home/vikas/.openclaw/workspace/phase2/ky
+  id: repo-20260506125737-a8473d6d
+  language: javascript
+  name: qa-agent
+  path: /home/vikas/qa-agent
 - enabled: true
-  id: repo-20260320000242-440a9a10
-  language: typescript
-  name: zulip
-  path: /home/vikas/.openclaw/workspace/zulip
+  id: repo-20260511044206-9e558339
+  language: python
+  name: click-test
+  path: /tmp/ceph-test-click
+- enabled: true
+  id: repo-20260511052224-050b37a9
+  language: python
+  name: ceph-e2e-test
+  path: /tmp/ceph-e2e-test/source-repo
+- enabled: true
+  id: repo-20260511145821-ece106a8
+  language: python
+  name: ceph-onboard-test
+  path: /tmp/ceph-onboard-test
 version: '1.0'

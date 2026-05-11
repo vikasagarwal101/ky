@@ -41,7 +41,7 @@ def test_doctor_command_runs():
     cli_path = _cli_path()
     result = subprocess.run([cli_path, 'doctor'], capture_output=True, text=True)
     assert result.returncode in [0, 1]
-    assert 'QA Agent Doctor' in result.stdout or result.returncode == 1
+    assert 'Ceph — Doctor' in result.stdout or result.returncode == 1
 
 
 def test_status_command_runs():
@@ -49,7 +49,7 @@ def test_status_command_runs():
     cli_path = _cli_path()
     result = subprocess.run([cli_path, 'status'], capture_output=True, text=True)
     assert result.returncode == 0
-    assert 'Repositories:' in result.stdout or 'QA Agent Status' in result.stdout
+    assert 'Repositories:' in result.stdout or 'Ceph — Status' in result.stdout
 
 
 def test_review_diagnostics_exposes_pending_and_failed_push_states(tmp_path):

@@ -16,6 +16,7 @@ from .reforge import (
     can_auto_refactor,
     LARGE_FILE_SAFETY_LIMIT,
 )
+from .refactor_queue import RefactorQueue, QueueStatus
 from .utils import run_capture, run_no_capture, sanitize_command_template, append_lesson, load_lessons_for_finding
 from .state import _append_text
 from .linters import (
@@ -855,14 +856,22 @@ def choose_validation_baseline(
     """Choose between repo-level and worktree-level baseline results.
 
     If the worktree has meaningful baseline results (non-empty with actual
-    check data), prefer those as they're specific to the worktree being
-    validated. Otherwise fall back to the repo-level results.
+    check data) AND the fingerprints differ from the repo (indicating drift),
+    prefer worktree-specific results. Otherwise fall back to the repo-level
+    results to avoid unnecessary baseline churn.
     """
     if worktree_baseline_results:
         first_val = next(iter(worktree_baseline_results.values()), None)
         if first_val is not None and first_val.get("rc") is not None:
-            _append_text(log_file, "validation-baseline: using worktree-specific baseline")
-            return worktree_baseline_results
+            # Only use worktree baseline if fingerprints differ (drift detected)
+            for key in worktree_baseline_results:
+                repo_fp = repo_baseline_results.get(key, {}).get("fingerprint")
+                wt_fp = worktree_baseline_results[key].get("fingerprint")
+                if repo_fp != wt_fp:
+                    _append_text(log_file, "validation-baseline: using worktree-specific baseline (drift detected)")
+                    return worktree_baseline_results
+            _append_text(log_file, "validation-baseline: using repo-level baseline (no drift)")
+            return repo_baseline_results
     _append_text(log_file, "validation-baseline: using repo-level baseline")
     return repo_baseline_results
 

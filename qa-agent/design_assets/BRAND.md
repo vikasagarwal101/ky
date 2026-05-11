@@ -31,15 +31,15 @@ Alternative / sub-taglines:
 
 ---
 
-> **When Ceph runs, problems die.**
+> **Keep your waters clean.**
 
-Proposed final (pending Sound): **Keep your waters clean.**
+Short-form: **Ink and dust.**
 
 Alternative / sub-taglines:
 - **Silence from the depths.**
+- **When Ceph runs, problems die.**
 - **Dive deep. Come up clean.**
 - **The echo killer.**
-- **Ink and dust.** (short-form / CLI footer)
 
 ---
 
@@ -200,6 +200,16 @@ Together they form **Waterworks HQ** — the ecosystem for AI-assisted developme
 
 ---
 
-*Brand file v1.1 — 2026-05-09*
-*Converged with Green. Awaiting Sound's calls on tagline, mascot, domain.*
+*Brand file v1.2 — 2026-05-09*
+*All decisions locked. Sound: keep your waters clean ✅ | octopus mascot ✅ | own domain (maturity-gated) ✅*
 *Part of Waterworks HQ*
+
+---
+
+## Implementation Priority (per Sound, 2026-05-09)
+
+> "Don't worry about the branding for now. Focus on the code before all of that. The actual use is what counts."
+
+Branding is done for now. These docs serve as the reference when the codebase matures enough to surface on its own domain.
+
+**Current priority:** Tighten the CLI, make the tank concept real in code, mature the `ceph run` / `ceph scan` / `ceph ink` flow. One clean cycle at a time.

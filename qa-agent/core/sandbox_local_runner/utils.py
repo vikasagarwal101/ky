@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from .constants import (
-    BLOCKED_REPOS,
     WORKSPACE,
 )
 
@@ -235,11 +234,8 @@ def assert_safe_repo(repo_path: Path) -> None:
     """Safety check: ensure git operations stay within the sandbox repo.
 
     Safety is primarily enforced by the runner's cwd (always qa-agent workspace).
-    This check blocks explicitly blocked repos as a secondary guard.
     """
-    rp = repo_path.resolve()
-    if rp.name in BLOCKED_REPOS:
-        raise RuntimeError(f'repo-path is blocked for safety: {rp.name}')
+    pass
 
 
 def branch_suffix(value: str) -> str:

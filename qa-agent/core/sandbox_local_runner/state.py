@@ -1,4 +1,4 @@
-"""sandbox_local_runner.state — State, issues, findings persistence and workload reconciliation."""
+"""sandbox_local_runner.state - State, issues, findings persistence and workload reconciliation."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .models import Finding, age_seconds, now_iso
 from .utils import run_capture
 from .gh import fetch_github_live_counts, get_origin_url
 
-MAX_COOLDOWN_SECONDS = 7 * 24 * 60 * 60  # 7 days — cap for exponential backoff
+MAX_COOLDOWN_SECONDS = 7 * 24 * 60 * 60  # 7 days - cap for exponential backoff
 
 
 def get_effective_cooldown(
@@ -216,6 +216,7 @@ def reconcile_open_workload(
     log_file: Path,
     simulate_open_issues: Optional[int],
     simulate_open_prs: Optional[int],
+    live_github_actions: bool = False,
 ) -> tuple[int, int, Dict[str, Any]]:
     before_issues = int(state.get('open_issues', 0))
     before_prs = int(state.get('open_prs', 0))
@@ -224,14 +225,15 @@ def reconcile_open_workload(
     reason = 'state-counters'
 
     origin_url = get_origin_url(repo_path)
-    live_counts, live_reason = fetch_github_live_counts(repo_path)
-    if live_counts is not None:
-        after_issues = int(live_counts['open_issues'])
-        after_prs = int(live_counts['open_prs'])
-        reason = live_reason
-    elif 'github.com' in origin_url:
-        reason = live_reason
-    else:
+    if live_github_actions:
+        live_counts, live_reason = fetch_github_live_counts(repo_path)
+        if live_counts is not None:
+            after_issues = int(live_counts['open_issues'])
+            after_prs = int(live_counts['open_prs'])
+            reason = live_reason
+        elif 'github.com' in origin_url:
+            reason = live_reason
+    elif 'github.com' not in origin_url:
         if simulate_open_issues is not None:
             after_issues = int(simulate_open_issues)
             reason = 'cli-simulated-open-workload'
@@ -329,7 +331,7 @@ def load_finding_record(finding_id: str, findings_file: Path) -> Optional[Dict[s
     """Load a single finding record by finding_id from a JSONL file.
 
     Returns the dict representation of the finding, or None if not found.
-    Does NOT reconstruct a Finding object — returns raw dict for efficiency.
+    Does NOT reconstruct a Finding object - returns raw dict for efficiency.
     Handles malformed lines gracefully.
     """
     if not findings_file.exists():
@@ -372,7 +374,7 @@ def update_finding_record(finding_id: str, findings_file: Path, updates: Dict[st
                     found = True
                 records.append(obj)
             except Exception:
-                # Malformed line — preserve as raw string
+                # Malformed line - preserve as raw string
                 records.append(raw)
 
     if not found:

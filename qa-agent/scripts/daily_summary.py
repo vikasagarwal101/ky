@@ -100,7 +100,14 @@ def build_summary_markdown(repo_name: str, date_str: str) -> str:
 
     open_issues = len(open_issue_list)
     open_prs = len(prs)
-    findings_entries = len(issues)  # all tracked findings entries
+    # findings_entries = line count of findings.jsonl (source of truth)
+    findings_file = REPOS_DIR / repo_name / "state" / "findings.jsonl"
+    findings_entries = 0
+    if findings_file.exists():
+        try:
+            findings_entries = sum(1 for line in findings_file.read_text().splitlines() if line.strip())
+        except Exception:
+            pass
 
     # Warn if status.json current_counts diverges from source-of-truth computation
     stale_counts = status.get("current_counts", {})

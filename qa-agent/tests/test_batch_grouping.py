@@ -442,7 +442,7 @@ class TestBatchGroupModel:
 class TestBatchStatusEnum:
     def test_all_statuses(self):
         expected = {'open', 'fixing', 'fixing_partial', 'pr_created',
-                    'pr_merged', 'failed', 'split', 'aborted', 'dry_run'}
+                    'pr_merged', 'failed', 'split', 'aborted', 'dry_run', 'skipped'}
         assert set(s.value for s in BatchStatus) == expected
 
 

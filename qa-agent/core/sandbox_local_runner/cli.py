@@ -57,7 +57,7 @@ from .constants import (
     DEFAULT_REPO, DETECTOR_CATALOG, WORKSPACE, AGENT_ROOT,
     DEFAULT_ISSUES, DEFAULT_WORKTREE_ROOT, DEFAULT_DOCS_INDEX,
     DEFAULT_LESSONS_LOG, BASELINE_VALIDATION_CHECKS, RULE_TARGET_CHECKS,
-    CLAUDE_REQUIRED_RULES, BLOCKED_REPOS, DEFAULT_FIX_ENGINE,
+    CLAUDE_REQUIRED_RULES, DEFAULT_FIX_ENGINE,
     DEFAULT_CLAUDE_CMD_TEMPLATE, QA_FIX_PROMPT_FILENAME,
     DEFAULT_FINDING_COOLDOWN_SECONDS, DEFAULT_STALENESS_THRESHOLD_SECONDS,
     DEFAULT_BATCH_RULES_PATH, DEFAULT_BATCH_STATE,
@@ -90,6 +90,42 @@ def _build_refactor_queue_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
+def _compute_health_score(
+    *,
+    raw_open_issues: int,
+    live_open_prs: int,
+    issues_list: List[Dict[str, Any]],
+) -> int:
+    """Compute a simple health score (0–100) from current state metrics.
+
+    Starts at 100 and deducts for:
+    - Open issues: -5 each
+    - Stuck PRs (not mergeable): -10 each
+    - Terminal/failed issues: -3 each
+    """
+    score = 100
+
+    # Open issues drain health
+    score -= raw_open_issues * 5
+
+    # Stuck PRs are costly
+    score -= live_open_prs * 10
+
+    # Terminal issues (exhausted retries, blocked paths)
+    terminal_statuses = {
+        'needs-human-max-retries-exceeded',
+        'needs-human-refactor-review',
+        'blocked_untracked_path',
+    }
+    terminal_count = sum(
+        1 for i in issues_list
+        if i.get('status') in terminal_statuses
+    )
+    score -= terminal_count * 3
+
+    return max(0, min(100, score))
+
+
 def _triage_pr_back_to_fix_cycle(
     *,
     issue: Dict[str, Any],
@@ -110,6 +146,84 @@ def _triage_pr_back_to_fix_cycle(
         log_file,
         f'triage: pr=#{pr_number} returned to pr-cycle reason={reason}',
     )
+
+
+def _rebase_pr(
+    *,
+    repo_path: Path,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    log_file: Path,
+) -> bool:
+    """Attempt to rebase a single PR branch onto its base branch.
+
+    Used for DIRTY/BEHIND PRs where a simple rebase resolves the merge
+    conflict trigger. Returns True if rebase + push succeeded.
+    Falls back silently — the caller should continue to triage on failure.
+    """
+    from .utils import run_capture, run_no_capture
+    try:
+        # Fetch both branches
+        run_no_capture(['git', 'fetch', 'origin', branch], cwd=repo_path)
+        run_no_capture(['git', 'fetch', 'origin', base_branch], cwd=repo_path)
+
+        # Create a temporary worktree for the rebase
+        import tempfile
+        worktree_path = Path(tempfile.mkdtemp(prefix=f'rebase-pr-{pr_number}-'))
+
+        rc, out = run_capture(
+            ['git', 'worktree', 'add', '-b', branch, str(worktree_path), f'origin/{branch}'],
+            cwd=repo_path,
+        )
+        if rc != 0:
+            _append_text(log_file, f'rebase-pr: #{pr_number} failed to create worktree')
+            run_no_capture(['rm', '-rf', str(worktree_path)], cwd=repo_path)
+            return False
+
+        # Rebase onto base branch
+        rc, out = run_capture(
+            ['git', 'rebase', f'origin/{base_branch}'],
+            cwd=worktree_path,
+        )
+        if rc != 0:
+            # Abort rebase, log conflict details
+            run_capture(['git', 'rebase', '--abort'], cwd=worktree_path)
+            conflict_files = run_capture(
+                ['git', 'diff', '--name-only', '--diff-filter=U'],
+                cwd=worktree_path,
+            )
+            _append_text(
+                log_file,
+                f'rebase-pr: #{pr_number} rebase conflicts in {conflict_files[1] if conflict_files[1] else "unknown files"}',
+            )
+            run_no_capture(['rm', '-rf', str(worktree_path)], cwd=repo_path)
+            run_no_capture(['git', 'worktree', 'prune'], cwd=repo_path)
+            return False
+
+        # Force push with lease
+        rc, out = run_capture(
+            ['git', 'push', '--force-with-lease', 'origin', f'HEAD:{branch}'],
+            cwd=worktree_path,
+        )
+        if rc != 0:
+            _append_text(log_file, f'rebase-pr: #{pr_number} force-push failed')
+            run_no_capture(['rm', '-rf', str(worktree_path)], cwd=repo_path)
+            run_no_capture(['git', 'worktree', 'prune'], cwd=repo_path)
+            return False
+
+        _append_text(log_file, f'rebase-pr: #{pr_number} rebased onto {base_branch} and pushed')
+        run_no_capture(['rm', '-rf', str(worktree_path)], cwd=repo_path)
+        run_no_capture(['git', 'worktree', 'prune'], cwd=repo_path)
+        return True
+
+    except Exception as e:
+        _append_text(log_file, f'rebase-pr: #{pr_number} unexpected error: {e}')
+        try:
+            run_no_capture(['git', 'worktree', 'prune'], cwd=repo_path)
+        except Exception:
+            pass
+        return False
 
 
 def _load_review_state(review_state_file: Path) -> Dict[str, Any]:
@@ -312,6 +426,11 @@ def update_status_artifact(
         'findings_entries': findings_entries,
         'refactor_queue_total': refactor_queue['total'],
         'by_status': dict(status_counter),
+        'health_score': _compute_health_score(
+            raw_open_issues=raw_open_issues,
+            live_open_prs=live_open_prs,
+            issues_list=issues_list,
+        ),
     }
     status['refactor_queue'] = refactor_queue
     status['last_reconciliation'] = reconcile_event
@@ -441,6 +560,8 @@ def main() -> int:
     p.add_argument('--log-lesson', dest='log_lesson', default='', help='Manual lesson entry to append to LESSONS_LOG.md')
     p.add_argument('--lessons-file', default=str(DEFAULT_LESSONS_LOG))
     p.add_argument('--tune-override', default='', help='Info flag: auto-tune overrides applied this cycle (e.g. max_prs_per_run=1)')
+    p.add_argument('--skip-rules', default='{}',
+                   help='JSON dict of {rule: [path_patterns]} to skip during discovery for exhausted rule+path combos')
 
     # Batch PR engine (Phase 1)
     p.add_argument('--batch-pr-enabled', action='store_true', default=True,
@@ -524,10 +645,6 @@ def main() -> int:
         return 2
 
     if args.fix_engine == 'claude':
-        if repo_path.name in BLOCKED_REPOS:
-            print(f'[ABORT] claude fix mode is blocked for repo: {repo_path.name}')
-            _append_text(log_file, f'abort: claude fix mode blocked for repo={repo_path.name}')
-            return 2
         if sys.executable is None or True:
             pass  # Keep going; the actual check happens at fix time
 
@@ -657,6 +774,7 @@ def main() -> int:
         log_file=log_file,
         simulate_open_issues=args.simulate_open_issues,
         simulate_open_prs=args.simulate_open_prs,
+        live_github_actions=args.live_github_actions,
     )
     state['last_run_at'] = now_iso()
 
@@ -741,6 +859,38 @@ def main() -> int:
         else:
             findings = []
             eligible_findings = []
+
+        # Apply skip-rules for exhausted rule+path combos (Task 2)
+        skip_rules_raw = args.skip_rules or '{}'
+        try:
+            skip_rules = json.loads(skip_rules_raw) if isinstance(skip_rules_raw, str) else {}
+        except (json.JSONDecodeError, TypeError):
+            skip_rules = {}
+        if skip_rules:
+            before = len(findings)
+            filtered: List[Finding] = []
+            for finding in findings:
+                path_patterns = skip_rules.get(finding.rule, [])
+                if path_patterns:
+                    # Check if the finding's path matches any exhausted pattern
+                    if finding.path in path_patterns:
+                        _append_text(log_file, f'skip-exhausted: rule={finding.rule} path={finding.path} finding_id={finding.finding_id}')
+                        continue
+                    # Also check if any pattern is a path prefix (e.g. directory-wide skip)
+                    skipped = False
+                    for pattern in path_patterns:
+                        if finding.path.startswith(pattern.rstrip('/') + '/'):
+                            _append_text(log_file, f'skip-exhausted-prefix: rule={finding.rule} path={finding.path} pattern={pattern} finding_id={finding.finding_id}')
+                            skipped = True
+                            break
+                    if skipped:
+                        continue
+                filtered.append(finding)
+            findings = filtered
+            skipped_count = before - len(findings)
+            if skipped_count:
+                _append_text(log_file, f'skip-exhausted-summary: suppressed_findings={skipped_count}')
+
         written_findings = append_findings(findings_file, findings)
         _append_text(log_file, f'discovery: findings_detected={len(findings)} findings_written={written_findings}')
         eligible_findings, suppressed_findings = filter_findings_by_cooldown(
@@ -1086,6 +1236,25 @@ def main() -> int:
                         _append_text(log_file, f'batch-cycle: {_bg.batch_id} -> {_detail}')
                     else:
                         _append_text(log_file, f'batch-cycle: {_bg.batch_id} failed: {_detail}')
+                        # When a batch is skipped because an equivalent PR already exists,
+                        # mark all issues as pr_opened and suppress the rule in
+                        # cycle_signals to stop re-creating issues for it.
+                        if not _success and _detail.startswith('duplicate-existing-pr-'):
+                            for _issue in _bg.issues:
+                                set_issue_status(_issue, 'pr_opened', 'existing batch PR already present for rule')
+                            try:
+                                _cs_path = AGENT_ROOT / 'state' / 'cycle_signals.json'
+                                _cs_data = json.loads(_cs_path.read_text()) if _cs_path.exists() else {'suppressed_rules': {}}
+                                _expires = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+                                _cs_data.setdefault('suppressed_rules', {})[_bg.rule_pattern] = {
+                                    'expires_at': _expires,
+                                    'reason': 'duplicate-batch-pr-exists',
+                                    'duration_cycles': 96,
+                                }
+                                _cs_path.write_text(json.dumps(_cs_data, indent=2) + '\n')
+                                _append_text(log_file, f'batch-cycle: suppressed rule {_bg.rule_pattern} in cycle_signals due to existing PR')
+                            except OSError as _e:
+                                _append_text(log_file, f'batch-cycle: failed to suppress rule {_bg.rule_pattern} in cycle_signals: {_e}')
 
             # Solo items use the same single-finding path as non-batch mode
             _iteration_items = _solo_items
@@ -1588,6 +1757,23 @@ def main() -> int:
                     else:
                         branch = str(pr.get('headRefName') or '')
                         if mergeability.get('requires_pr_fix', False):
+                            # Attempt rebase before triaging to full fix cycle
+                            base_branch = str(pr.get('baseRefName', 'main'))
+                            rebase_ok = _rebase_pr(
+                                repo_path=repo_path,
+                                pr_number=pr_number,
+                                branch=branch,
+                                base_branch=base_branch,
+                                log_file=log_file,
+                            )
+                            if rebase_ok:
+                                _append_text(
+                                    log_file,
+                                    f'merge-rebase: pr=#{pr_number} rebased onto {base_branch}, '
+                                    'will re-evaluate on next review cycle',
+                                )
+                                continue
+                            # Rebase failed — fall through to triage
                             for issue in issues_data.get('issues', []):
                                 issue_github = issue.get('github', {}) if isinstance(issue.get('github'), dict) else {}
                                 if int(issue_github.get('pr_number') or 0) == pr_number:
@@ -1701,6 +1887,7 @@ def main() -> int:
                     log_file=log_file,
                     simulate_open_issues=args.simulate_open_issues,
                     simulate_open_prs=args.simulate_open_prs,
+                    live_github_actions=args.live_github_actions,
                 )
 
     save_issues(issues_file, issues_data)

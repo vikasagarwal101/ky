@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Repository registry management."""
 
-import fcntl
 import json
-import os
 from pathlib import Path
 from typing import Dict, List, Optional
 import yaml
 
 from .models import Repo, RepoConfig, RepoStatus, generate_id, now_iso
 from .config import ConfigManager
+from .state import _atomic_json_write
 
 
 class RepoRegistry:
@@ -48,18 +47,7 @@ class RepoRegistry:
 
     def _save_repo_state_file(self, state_file: Path, state: Dict) -> None:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = state_file.with_suffix(state_file.suffix + '.tmp')
-        lock_file = state_file.with_suffix('.lock')
-        with open(lock_file, 'w') as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                with open(tmp_file, 'w') as f:
-                    json.dump(state, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_file, state_file)
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+        _atomic_json_write(state_file, state)
 
     def create(self, config: RepoConfig) -> Repo:
         """Create a new repo entry."""

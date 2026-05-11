@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional
 from .models import Finding, Run, generate_id, now_iso
 
 
+# ——— Findings rotation defaults ———
+_FINDINGS_ROTATION_MAX_ENTRIES = 5000
+_FINDINGS_ROTATION_MAX_AGE_DAYS = 14
+
+
 def _atomic_json_write(path: Path, data: Any) -> None:
     """Write JSON data atomically: temp file + rename, same filesystem.
 
@@ -197,7 +202,186 @@ class StateManager:
         findings_file = self.get_findings_file(repo_name)
         if findings_file.exists():
             findings_file.unlink()
-    
+
+    def _rotate_findings_if_needed(
+        self,
+        repo_name: str,
+        max_entries: int = _FINDINGS_ROTATION_MAX_ENTRIES,
+        max_age_days: int = _FINDINGS_ROTATION_MAX_AGE_DAYS,
+    ) -> int:
+        """
+        Rotate findings.jsonl if it exceeds thresholds.
+
+        Splits findings into:
+        - Hot: findings from the last ``max_age_days`` OR referenced by active
+          issues (any status not in the non-actionable set).
+        - Cold: everything else, appended to ``findings.jsonl.archive``.
+
+        After rotation, ``findings.jsonl`` contains only hot/active findings
+        and ``findings.jsonl.archive`` accumulates cold (stale) findings.
+
+        Args:
+            repo_name: Repository name.
+            max_entries: Maximum entries before rotation triggers.
+            max_age_days: Age threshold for stale findings.
+
+        Returns:
+            Number of cold (archived) findings.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        findings_file = self.get_findings_file(repo_name)
+        if not findings_file.exists():
+            return 0
+
+        # Quick size check to avoid unnecessary work
+        if findings_file.stat().st_size == 0:
+            return 0
+
+        # Read all current findings
+        findings = self.load_findings(repo_name)
+        if len(findings) < max_entries * 0.8:
+            # Not enough to justify rotation — skip
+            return 0
+
+        # Load active issue finding_ids so we don't archive referenced findings
+        issues = self.load_issues(repo_name)
+        active_finding_ids: set = set()
+        for issue in issues.get('issues', []):
+            status = issue.get('status', 'open')
+            fid = issue.get('finding_id')
+            if fid and status not in (
+                'resolved_merged',
+                'resolved_verified',
+                'needs-human-max-retries-exceeded',
+                'needs-human-not-fixable',
+                'needs-human-refactor-review',
+            ):
+                active_finding_ids.add(fid)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        archive_path = findings_file.with_suffix(findings_file.suffix + '.archive')
+
+        hot: list = []
+        cold: list = []
+
+        for finding in findings:
+            # Check if finding is active (referenced by non-resolved issue)
+            is_active_issue = finding.finding_id in active_finding_ids
+
+            # Check if finding is recent
+            is_recent = False
+            if finding.discovered_at:
+                try:
+                    dt = datetime.fromisoformat(finding.discovered_at.replace('Z', '+00:00'))
+                    if dt >= cutoff:
+                        is_recent = True
+                except (ValueError, TypeError):
+                    pass
+
+            if is_active_issue or is_recent:
+                hot.append(finding)
+            else:
+                cold.append(finding)
+
+        if not cold:
+            return 0
+
+        # Rewrite hot findings back to findings.jsonl
+        import json
+        findings_file.write_text(
+            ''.join(json.dumps(f.to_dict()) + '\n' for f in hot),
+            encoding='utf-8',
+        )
+
+        # Append cold findings to archive
+        with open(archive_path, 'a', encoding='utf-8') as f:
+            for finding in cold:
+                f.write(json.dumps(finding.to_dict()) + '\n')
+
+        return len(cold)
+
+    # === Exhausted rule/path suppression (Task 2) ===
+
+    def get_exhausted_rule_paths_file(self, repo_name: str) -> Path:
+        """Path to the exhausted rule+path suppression JSON file."""
+        return self._get_state_dir(repo_name) / 'exhausted_rule_paths.json'
+
+    def load_exhausted_rule_paths(self, repo_name: str) -> Dict[str, Dict[str, str]]:
+        """
+        Load exhausted rule+path suppression data.
+
+        Returns a dict mapping::
+
+            {rule: {path: timestamp_iso}}
+
+        where ``path`` is a file path (or glob-like pattern) that should be
+        skipped during discovery for the given rule.
+        """
+        path = self.get_exhausted_rule_paths_file(repo_name)
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save_exhausted_rule_paths(self, repo_name: str, data: Dict[str, Dict[str, str]]) -> None:
+        """Save exhausted rule+path suppression data atomically."""
+        path = self.get_exhausted_rule_paths_file(repo_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(path, data)
+
+    def get_exhausted_skips(self, repo_name: str) -> Dict[str, list]:
+        """
+        Get exhausted skips in the format that the sandbox runner expects.
+
+        Returns::
+
+            {rule: [path_patterns]}
+
+        This is shaped for a ``--skip-rules`` JSON CLI argument consumed by
+        ``sandbox_local_runner`` to suppress discovery for known-exhausted
+        rule+path combos.
+        """
+        raw_data = self.load_exhausted_rule_paths(repo_name)
+        result: Dict[str, list] = {}
+        for rule, paths in raw_data.items():
+            result[rule] = list(paths.keys())
+        return result
+
+    def sync_exhausted_from_issues(self, repo_name: str) -> int:
+        """
+        Scan issues.json for ``needs-human-max-retries-exceeded`` issues and
+        sync their rule+path into the exhausted store.
+
+        Returns the number of newly exhausted entries added.
+        """
+        issues = self.load_issues(repo_name)
+        exhausted = self.load_exhausted_rule_paths(repo_name)
+        now_ts = now_iso()
+        new_count = 0
+
+        for issue in issues.get('issues', []):
+            if issue.get('status') != 'needs-human-max-retries-exceeded':
+                continue
+            rule = issue.get('rule', '')
+            path = issue.get('path', '')
+            if not rule or not path:
+                continue
+            # Ensure the rule entry exists
+            if rule not in exhausted:
+                exhausted[rule] = {}
+            # Only count as new if not already recorded
+            if path not in exhausted[rule]:
+                exhausted[rule][path] = now_ts
+                new_count += 1
+
+        if new_count > 0:
+            self.save_exhausted_rule_paths(repo_name, exhausted)
+
+        return new_count
+
     # === Issues ===
     
     def get_issues_file(self, repo_name: str) -> Path:

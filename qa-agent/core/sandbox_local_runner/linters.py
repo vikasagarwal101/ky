@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from .constants import DETECTOR_CATALOG
+from .constants import DETECTOR_CATALOG, GENERIC_RULES, TYPESCRIPT_RULES, PYTHON_RULES
 from .models import Finding, stable_finding_id
 from .state import _append_text
 from .utils import run_capture
@@ -201,7 +201,7 @@ def discover_xo_linter_findings(repo_path: Path, log_file: Path) -> List[Finding
         _append_text(log_file, f'xo-discovery: xo linter failed with rc={rc}')
         return findings
 
-    rule_meta = {entry['rule']: entry for entry in DETECTOR_CATALOG}
+    rule_meta = {entry['rule']: entry for entry in TYPESCRIPT_RULES}
 
     # Process xo results
     total_warnings = 0
@@ -332,7 +332,7 @@ def discover_python_linter_findings(repo_path: Path, log_file: Path) -> List[Fin
         _append_text(log_file, 'python-discovery: no ruff findings')
         return findings
 
-    rule_meta = {entry['rule']: entry for entry in DETECTOR_CATALOG}
+    rule_meta = {entry['rule']: entry for entry in PYTHON_RULES}
     seen_finding_ids: set[str] = set()
 
     try:
@@ -426,7 +426,7 @@ def discover_typescript_type_findings(repo_path: Path, log_file: Path) -> List[F
     - Untyped imports / modules with missing declarations
     """
     findings: List[Finding] = []
-    rule_meta = {entry['rule']: entry for entry in DETECTOR_CATALOG}
+    rule_meta = {entry['rule']: entry for entry in TYPESCRIPT_RULES}
 
     # Check if this is a TypeScript repo
     ts_config = repo_path / 'tsconfig.json'
@@ -504,7 +504,7 @@ def discover_test_coverage_findings(repo_path: Path, log_file: Path) -> List[Fin
     - Uncovered lines (for smaller gaps only)
     """
     findings: List[Finding] = []
-    rule_meta = {entry['rule']: entry for entry in DETECTOR_CATALOG}
+    rule_meta = {entry['rule']: entry for entry in TYPESCRIPT_RULES}
 
     # Check for coverage report or run coverage
     coverage_file = repo_path / 'coverage' / 'coverage-final.json'
@@ -617,4 +617,578 @@ def discover_test_coverage_findings(repo_path: Path, log_file: Path) -> List[Fin
     else:
         _append_text(log_file, 'coverage-discovery: no coverage data available')
 
+    return findings
+
+
+# ── New Detectors (2026-05-11) ─────────────────────────────────
+
+def _find_tool(binary: str) -> Optional[str]:
+    """Find a tool binary in common locations. Returns full path or None."""
+    for candidate in [binary, f'~/.local/bin/{binary}', f'/home/vikas/.local/bin/{binary}',
+                      f'/home/vikas/go/bin/{binary}', f'/home/vikas/.npm-global/bin/{binary}']:
+        expanded = Path(candidate).expanduser()
+        if expanded.exists():
+            return str(expanded)
+    try:
+        res = subprocess.run(['which', binary], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _discover_tool_findings(
+    repo_path: Path,
+    log_file: Path,
+    binary: str,
+    args: List[str],
+    rule_prefix: str,
+    rule_catalog: List[Dict[str, Any]],
+    findings_label: str,
+    repo_check: Optional[List[str]] = None,
+    output_is_json: bool = True,
+    parse_fn=None,
+    timeout: int = 120,
+) -> List[Finding]:
+    """Generic tool-based finding discovery."""
+    findings: List[Finding] = []
+    tool_path = _find_tool(binary)
+    if not tool_path:
+        _append_text(log_file, f'{findings_label}: {binary} not found, skipping')
+        return findings
+
+    if repo_check:
+        has_files = False
+        for pattern in repo_check:
+            if list(repo_path.rglob(pattern)):
+                has_files = True
+                break
+        if not has_files:
+            _append_text(log_file, f'{findings_label}: no matching files found, skipping')
+            return findings
+
+    _append_text(log_file, f'{findings_label}: running {binary}')
+
+    try:
+        res = subprocess.run(
+            [tool_path] + args,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, cwd=str(repo_path),
+        )
+        raw = (res.stdout or '').strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _append_text(log_file, f'{findings_label}: {binary} failed: {e}')
+        return findings
+    except Exception as e:
+        _append_text(log_file, f'{findings_label}: {binary} error: {e}')
+        return findings
+
+    if not raw:
+        _append_text(log_file, f'{findings_label}: no output from {binary}')
+        return findings
+
+    rule_meta = {entry['rule']: entry for entry in rule_catalog}
+
+    if output_is_json and parse_fn:
+        try:
+            data = json.loads(raw)
+            findings = parse_fn(data, repo_path, rule_prefix, rule_meta)
+        except (json.JSONDecodeError, Exception) as e:
+            _append_text(log_file, f'{findings_label}: parse error: {e}')
+            return findings
+    elif output_is_json:
+        try:
+            data = json.loads(raw)
+            findings = _default_json_parse(data, repo_path, rule_prefix, rule_meta)
+        except (json.JSONDecodeError, Exception) as e:
+            _append_text(log_file, f'{findings_label}: parse error: {e}')
+            return findings
+    else:
+        findings = _default_line_parse(raw, repo_path, rule_prefix, rule_meta)
+
+    _append_text(log_file, f'{findings_label}: found {len(findings)} findings')
+    return findings
+
+
+def _default_json_parse(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Default JSON parser: expects list of {filePath, messages: [{ruleId, message, line, column}]}."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    if isinstance(data, dict):
+        results = data.get('results') or data.get('issues', []) or [data]
+    elif isinstance(data, list):
+        results = data
+    else:
+        return findings
+    for result in results:
+        file_path = str(result.get('filePath', result.get('path', result.get('filename', ''))))
+        messages = result.get('messages', [])
+        if not messages and 'message' in result:
+            messages = [result]
+        for msg in messages:
+            rule_id = str(msg.get('ruleId', msg.get('rule', '')))
+            message_text = str(msg.get('message', ''))
+            line = int(msg.get('line', msg.get('row', 0)))
+            if not rule_id:
+                continue
+            full_rule = f'{rule_prefix}{rule_id.lower()}'
+            if full_rule not in rule_meta:
+                rule_meta[full_rule] = {'rule': full_rule, 'category': 'lint', 'confidence': 0.75, 'autofix': False}
+            meta = rule_meta[full_rule]
+            try:
+                relative_path = str(Path(file_path).relative_to(repo_path))
+            except (ValueError, Exception):
+                relative_path = file_path
+            snippet = message_text[:200] if message_text else full_rule
+            finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+            if finding_id in seen:
+                continue
+            seen.add(finding_id)
+            findings.append(Finding(
+                finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+                rule=full_rule, snippet=snippet,
+                confidence=float(meta.get('confidence', 0.75)),
+                quick_win=bool(meta.get('autofix', False)),
+                safe_to_autofix=bool(meta.get('autofix', False)),
+            ))
+    return findings
+
+
+def _default_line_parse(output: str, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse line-based output where each line has file:line:col: message."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    pattern = re.compile(r'^(.+?):(\d+):(\d+):\s*(.+?)(?:\s+\[(.+?)\])?\s*$', re.MULTILINE)
+    for match in pattern.finditer(output):
+        file_path, line_str, col_str, message, rule_id = match.groups()
+        line = int(line_str)
+        rule = rule_id if rule_id else 'general'
+        full_rule = f'{rule_prefix}{rule}'
+        if full_rule not in rule_meta:
+            rule_meta[full_rule] = {'rule': full_rule, 'category': 'lint', 'confidence': 0.75, 'autofix': False}
+        meta = rule_meta[full_rule]
+        try:
+            relative_path = str(Path(file_path).relative_to(repo_path))
+        except (ValueError, Exception):
+            relative_path = file_path
+        snippet = (message or full_rule)[:200]
+        finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        findings.append(Finding(
+            finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+            rule=full_rule, snippet=snippet,
+            confidence=float(meta.get('confidence', 0.75)),
+            quick_win=bool(meta.get('autofix', False)),
+            safe_to_autofix=bool(meta.get('autofix', False)),
+        ))
+    return findings
+
+
+def _parse_eslint_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse ESLint JSON output format."""
+    return _default_json_parse(data, repo_path, rule_prefix, rule_meta)
+
+
+def _parse_staticcheck_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse staticcheck JSON output format."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get('results', data.get('issues', [data]))
+    else:
+        return findings
+    for item in items:
+        code = str(item.get('code', ''))
+        message_text = str(item.get('message', ''))
+        loc = item.get('location', item.get('position', {}))
+        file_path = str(loc.get('file', loc.get('filename', '')))
+        line = int(loc.get('line', loc.get('row', 0)))
+        if not code:
+            continue
+        code_lower = code.lower()
+        full_rule = f'go-staticcheck-{code_lower}'
+        if full_rule not in rule_meta:
+            if code_lower.startswith('sa'):
+                full_rule = 'go-staticcheck-sa'
+            elif code_lower.startswith('st'):
+                full_rule = 'go-staticcheck-st'
+            elif code_lower.startswith('s1'):
+                full_rule = 'go-staticcheck-s1000'
+        meta = rule_meta.get(full_rule, {'rule': full_rule, 'category': 'bug', 'confidence': 0.85, 'autofix': False})
+        try:
+            relative_path = str(Path(file_path).relative_to(repo_path))
+        except (ValueError, Exception):
+            relative_path = file_path
+        snippet = (message_text or code)[:200]
+        finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        findings.append(Finding(
+            finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+            rule=full_rule, snippet=snippet,
+            confidence=float(meta.get('confidence', 0.85)),
+            quick_win=bool(meta.get('autofix', False)),
+            safe_to_autofix=bool(meta.get('autofix', False)),
+        ))
+    return findings
+
+
+def _parse_shellcheck_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse ShellCheck JSON1 output format."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    comments = data.get('comments', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    for comment in comments:
+        file_path = str(comment.get('file', ''))
+        line = int(comment.get('line', 0))
+        code = str(comment.get('code', ''))
+        message_text = str(comment.get('message', ''))
+        full_rule = f'shellcheck-sc{code}' if code else 'shellcheck-general'
+        meta = rule_meta.get(full_rule, {'rule': full_rule, 'category': 'lint', 'confidence': 0.78, 'autofix': False})
+        try:
+            relative_path = str(Path(file_path).relative_to(repo_path))
+        except (ValueError, Exception):
+            relative_path = file_path
+        snippet = (message_text or code or 'shell issue')[:200]
+        finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        findings.append(Finding(
+            finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+            rule=full_rule, snippet=snippet,
+            confidence=float(meta.get('confidence', 0.78)),
+            quick_win=False, safe_to_autofix=False,
+        ))
+    return findings
+
+
+def _parse_hadolint_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse hadolint JSON output format."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        file_path = str(item.get('file', ''))
+        line = int(item.get('line', 1))
+        code = str(item.get('code', 'general')).upper()
+        message_text = str(item.get('message', ''))
+        full_rule = f'hadolint-{code.lower()}'
+        meta = rule_meta.get(full_rule, {'rule': 'hadolint-general', 'category': 'lint', 'confidence': 0.78, 'autofix': False})
+        try:
+            relative_path = str(Path(file_path).relative_to(repo_path))
+        except (ValueError, Exception):
+            relative_path = file_path
+        snippet = (message_text or code)[:200]
+        finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        findings.append(Finding(
+            finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+            rule=full_rule, snippet=snippet,
+            confidence=float(meta.get('confidence', 0.78)),
+            quick_win=False, safe_to_autofix=False,
+        ))
+    return findings
+
+
+def _parse_markdownlint_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse markdownlint JSON output format.
+    Supports both:
+    - Dict format: {"/path/file.md": [{"lineNumber": ..., "ruleNames": [...], ...}]}
+    - Array format: [{"fileName": "...", "lineNumber": ..., "ruleNames": [...], ...}]
+    """
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+
+    if isinstance(data, dict):
+        # Dict format: file_path -> issues list
+        for file_path, issues in data.items():
+            if not isinstance(issues, list):
+                continue
+            for issue in issues:
+                _add_mdl_finding(file_path, issue, repo_path, rule_prefix, rule_meta, findings, seen)
+    elif isinstance(data, list):
+        # Array format: each item has fileName + issue fields directly
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get('fileName', item.get('file', item.get('filePath', ''))))
+            _add_mdl_finding(file_path, item, repo_path, rule_prefix, rule_meta, findings, seen)
+
+    return findings
+
+
+def _add_mdl_finding(file_path, issue, repo_path, rule_prefix, rule_meta, findings, seen):
+    """Helper to add a single markdownlint finding."""
+    from .models import stable_finding_id
+    line = int(issue.get('lineNumber', issue.get('line', 1)))
+    rule_names = issue.get('ruleNames', [])
+    rule_id = rule_names[0].lower() if rule_names else 'general'
+    detail = str(issue.get('errorDetail', ''))
+    desc = str(issue.get('ruleDescription', ''))
+    full_rule = f'mdl-{rule_id}'
+    meta = rule_meta.get(full_rule, {
+        'rule': 'mdl-general', 'category': 'style', 'confidence': 0.68, 'autofix': False,
+    })
+    try:
+        relative_path = str(Path(file_path).relative_to(repo_path))
+    except (ValueError, Exception):
+        relative_path = file_path
+    snippet = (detail or desc or rule_id)[:200]
+    finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+    if finding_id in seen:
+        return
+    seen.add(finding_id)
+    findings.append(Finding(
+        finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+        rule=full_rule, snippet=snippet,
+        confidence=float(meta.get('confidence', 0.68)),
+        quick_win=False, safe_to_autofix=False,
+    ))
+
+
+def _parse_gitleaks_output(data, repo_path: Path, rule_prefix: str, rule_meta: dict) -> List[Finding]:
+    """Parse gitleaks JSON output format."""
+    from .models import stable_finding_id
+    findings: List[Finding] = []
+    seen: set = set()
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        description = str(item.get('Description', ''))
+        file_path = str(item.get('File', item.get('file', '')))
+        line = int(item.get('StartLine', item.get('line', item.get('startLine', 0))))
+        rule_id_raw = str(item.get('RuleID', item.get('rule_id', item.get('rule', '')))).lower()
+        match = str(item.get('Match', item.get('match', '')))
+        rule_mapping = {
+            'aws': 'secret-aws-key', 'github': 'secret-github-token',
+            'generic-api-key': 'secret-generic-api-key',
+            'private-key': 'secret-private-key', 'ssh-private-key': 'secret-private-key',
+            'high-entropy': 'secret-high-entropy-string',
+        }
+        full_rule = 'secret-generic-api-key'
+        for key, mapped in rule_mapping.items():
+            if key in rule_id_raw:
+                full_rule = mapped
+                break
+        meta = rule_meta.get(full_rule, {'rule': full_rule, 'category': 'secret', 'confidence': 0.95, 'autofix': False})
+        try:
+            relative_path = str(Path(file_path).relative_to(repo_path))
+        except (ValueError, Exception):
+            relative_path = file_path
+        snippet = (description or match or 'potential secret')[0:200]
+        finding_id = stable_finding_id(str(repo_path), relative_path, line, full_rule, snippet)
+        if finding_id in seen:
+            continue
+        seen.add(finding_id)
+        findings.append(Finding(
+            finding_id=finding_id, repo=str(repo_path), path=relative_path, line=line,
+            rule=full_rule, snippet=snippet,
+            confidence=float(meta.get('confidence', 0.95)),
+            quick_win=False, safe_to_autofix=False,
+        ))
+    return findings
+
+
+def discover_eslint_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from ESLint for JavaScript/TypeScript repos."""
+    # Check for eslint config before running — ESLint crashes without one
+    eslint_configs = [
+        '.eslintrc', '.eslintrc.js', '.eslintrc.cjs', '.eslintrc.yaml',
+        '.eslintrc.yml', '.eslintrc.json', '.eslintrc.mjs',
+    ]
+    has_config = any((repo_path / cfg).exists() for cfg in eslint_configs)
+    # Also check for eslintConfig in package.json
+    if not has_config:
+        pkg = repo_path / 'package.json'
+        if pkg.exists():
+            try:
+                pkg_data = json.loads(pkg.read_text())
+                if pkg_data.get('eslintConfig'):
+                    has_config = True
+            except Exception:
+                pass
+
+    if not has_config:
+        _append_text(log_file, 'eslint-discovery: no eslint config found, skipping')
+        return []
+
+    return _discover_tool_findings(
+        repo_path, log_file, binary='eslint',
+        args=['--format=json', '.'],
+        rule_prefix='eslint-', rule_catalog=[],
+        findings_label='eslint-discovery',
+        repo_check=['*.js', '*.jsx', '*.ts', '*.tsx', '*.mjs', '*.cjs'],
+        parse_fn=_parse_eslint_output, timeout=180,
+    )
+
+
+def discover_staticcheck_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from staticcheck for Go repos."""
+    from .constants import GO_RULES
+    return _discover_tool_findings(
+        repo_path, log_file, binary='staticcheck',
+        args=['-f', 'json', './...'],
+        rule_prefix='go-', rule_catalog=GO_RULES,
+        findings_label='staticcheck-discovery',
+        repo_check=['*.go'],
+        parse_fn=_parse_staticcheck_output, timeout=180,
+    )
+
+
+def discover_shellcheck_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from ShellCheck for shell/bash scripts."""
+    from .constants import SHELL_RULES
+
+    # Find all shell files recursively
+    shell_files = []
+    for pattern in ('*.sh', '*.bash', '*.ksh'):
+        shell_files.extend(repo_path.rglob(pattern))
+    shell_files = [f for f in shell_files if f.is_file() and not any(
+        p.name in ('node_modules', '.git', '__pycache__') for p in f.parents
+    )]
+
+    if not shell_files:
+        _append_text(log_file, 'shellcheck-discovery: no shell scripts found, skipping')
+        return []
+
+    _append_text(log_file, f'shellcheck-discovery: running shellcheck on {len(shell_files)} files')
+
+    return _discover_tool_findings(
+        repo_path, log_file, binary='shellcheck',
+        args=['--format=json1', '--shell=bash', '--severity=style']
+            + [str(f.relative_to(repo_path)) for f in shell_files],
+        rule_prefix='shellcheck-', rule_catalog=SHELL_RULES,
+        findings_label='shellcheck-discovery',
+        parse_fn=_parse_shellcheck_output, timeout=180,
+    )
+
+
+def discover_hadolint_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from hadolint for Dockerfiles."""
+    from .constants import DOCKER_RULES
+
+    # Expand glob in Python since subprocess doesn't handle ** globs
+    dockerfiles = sorted(repo_path.rglob('Dockerfile*'))
+    dockerfiles = [f for f in dockerfiles if f.is_file() and not any(
+        p.name in ('node_modules', '.git', '__pycache__') for p in f.parents
+    )]
+
+    if not dockerfiles:
+        _append_text(log_file, 'hadolint-discovery: no Dockerfiles found, skipping')
+        return []
+
+    _append_text(log_file, f'hadolint-discovery: found {len(dockerfiles)} Dockerfile(s), running hadolint')
+
+    return _discover_tool_findings(
+        repo_path, log_file, binary='hadolint',
+        args=['--format', 'json'] + [str(f.relative_to(repo_path)) for f in dockerfiles],
+        rule_prefix='hadolint-', rule_catalog=DOCKER_RULES,
+        findings_label='hadolint-discovery',
+        parse_fn=_parse_hadolint_output, timeout=60,
+    )
+
+
+def discover_markdownlint_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from markdownlint for Markdown files."""
+    from .constants import MARKDOWN_RULES
+
+    md_files = sorted(repo_path.rglob('*.md'))
+    md_files = [f for f in md_files if f.is_file() and not any(
+        p.name in ('node_modules', '.git', '__pycache__') for p in f.parents
+    )]
+
+    if not md_files:
+        _append_text(log_file, 'markdownlint-discovery: no markdown files found, skipping')
+        return []
+
+    _append_text(log_file, f'markdownlint-discovery: running markdownlint on {len(md_files)} files')
+
+    return _discover_tool_findings(
+        repo_path, log_file, binary='markdownlint',
+        args=['--json'] + [str(f.relative_to(repo_path)) for f in md_files],
+        rule_prefix='mdl-', rule_catalog=MARKDOWN_RULES,
+        findings_label='markdownlint-discovery',
+        parse_fn=_parse_markdownlint_output, timeout=120,
+    )
+
+
+def discover_actionlint_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover findings from actionlint for GitHub Actions workflows."""
+    from .constants import ACTIONS_RULES
+    return _discover_tool_findings(
+        repo_path, log_file, binary='actionlint',
+        args=['-no-color'],
+        rule_prefix='actionlint-', rule_catalog=ACTIONS_RULES,
+        findings_label='actionlint-discovery',
+        repo_check=['.github/workflows/*.yml'],
+        output_is_json=False, timeout=60,
+    )
+
+
+def discover_gitleaks_findings(repo_path: Path, log_file: Path) -> List[Finding]:
+    """Discover secrets using gitleaks."""
+    from .constants import SECRET_RULES
+    import tempfile
+    import os
+
+    findings: List[Finding] = []
+    tool_path = _find_tool('gitleaks')
+    if not tool_path:
+        _append_text(log_file, 'gitleaks-discovery: gitleaks not found, skipping')
+        return findings
+
+    _append_text(log_file, 'gitleaks-discovery: running gitleaks')
+
+    # Gitleaks writes the report to --report-path; stdout contains banner + info lines
+    tmp_report = Path(tempfile.mktemp(suffix='.json'))
+    try:
+        res = subprocess.run(
+            [tool_path, 'detect', '--no-git', '--source', str(repo_path),
+             '--report-format', 'json', '--report-path', str(tmp_report)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=120, cwd=str(repo_path),
+        )
+        if tmp_report.exists() and tmp_report.stat().st_size > 0:
+            raw = tmp_report.read_text().strip()
+        else:
+            raw = ''
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _append_text(log_file, f'gitleaks-discovery: gitleaks failed: {e}')
+        return findings
+    except Exception as e:
+        _append_text(log_file, f'gitleaks-discovery: gitleaks error: {e}')
+        return findings
+    finally:
+        try:
+            tmp_report.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not raw or raw == 'null' or raw == '[]':
+        _append_text(log_file, 'gitleaks-discovery: no secrets found')
+        return findings
+
+    rule_meta = {entry['rule']: entry for entry in SECRET_RULES}
+    try:
+        data = json.loads(raw)
+        findings = _parse_gitleaks_output(data, repo_path, 'secret-', rule_meta)
+    except (json.JSONDecodeError, Exception) as e:
+        _append_text(log_file, f'gitleaks-discovery: parse error: {e}')
+        return findings
+
+    _append_text(log_file, f'gitleaks-discovery: found {len(findings)} secrets')
     return findings

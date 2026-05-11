@@ -108,8 +108,10 @@ def test_normalize_snapshot_filters_bots_and_author_comments(tmp_path):
     )
 
     assert snapshot["active_change_requesters"] == ["reviewer1"]
-    assert len(snapshot["actionable_comments"]) == 1
-    assert snapshot["actionable_comments"][0]["body"] == "please add tests"
+    # "Please add tests" lacks blocking language → classified as informational
+    assert len(snapshot["actionable_comments"]) == 0
+    assert len(snapshot["informational_comments"]) == 1
+    assert snapshot["informational_comments"][0]["body"] == "please add tests"
     assert snapshot["fingerprint"]
 
 

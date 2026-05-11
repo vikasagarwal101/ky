@@ -27,51 +27,119 @@ DEFAULT_CLAUDE_CMD_TEMPLATE = (
     'Run relevant tests and exit non-zero on failure."'
 )
 QA_FIX_PROMPT_FILENAME = '.qa-fix-prompt.md'
-BLOCKED_REPOS = {'workout-planner-app', 'diet-tracking-app', 'mem-db'}
 DEFAULT_FINDING_COOLDOWN_SECONDS = 4 * 60 * 60
 DEFAULT_STALENESS_THRESHOLD_SECONDS = 2 * 60 * 60
 MAX_RECONCILIATION_EVENTS = 100
 
-DETECTOR_CATALOG: List[Dict[str, Any]] = [
-    {'rule': 'discount-math-sign', 'category': 'bug', 'confidence': 0.95, 'autofix': True},
-    {'rule': 'catalog-query-not-normalized', 'category': 'bug', 'confidence': 0.93, 'autofix': True},
-    {'rule': 'orders-tax-truncation', 'category': 'bug', 'confidence': 0.92, 'autofix': False},
-    {'rule': 'notifications-email-no-trim', 'category': 'bug', 'confidence': 0.89, 'autofix': True},
-    {'rule': 'notifications-type-guard-missing', 'category': 'bug', 'confidence': 0.87, 'autofix': True},
-    {'rule': 'inventory-invalid-quantity', 'category': 'bug', 'confidence': 0.84, 'autofix': True},
-    {'rule': 'broad-except', 'category': 'lint', 'confidence': 0.88, 'autofix': False},
-    {'rule': 'hardcoded-tmp-path', 'category': 'lint', 'confidence': 0.81, 'autofix': True},
-    {'rule': 'trailing-whitespace', 'category': 'lint', 'confidence': 0.75, 'autofix': True},
-    {'rule': 'debt-todo-marker', 'category': 'todo/debt', 'confidence': 0.72, 'autofix': False},
-    {'rule': 'docs-legacy-reference', 'category': 'docs-mismatch', 'confidence': 0.91, 'autofix': True},
-    {'rule': 'docs-missing-rollback', 'category': 'docs-gap', 'confidence': 0.86, 'autofix': True},
-    {'rule': 'docs-quickstart-gap', 'category': 'docs-gap', 'confidence': 0.74, 'autofix': True},
-    {'rule': 'perf-pop-front-loop', 'category': 'perf-smell', 'confidence': 0.83, 'autofix': True},
-    {'rule': 'perf-list-membership-loop', 'category': 'perf-smell', 'confidence': 0.82, 'autofix': True},
-    {'rule': 'test-gap-missing-file', 'category': 'test-gap', 'confidence': 0.79, 'autofix': True},
-    {'rule': 'test-gap-missing-case', 'category': 'test-gap', 'confidence': 0.77, 'autofix': True},
-    {'rule': 'doc-gap-uncovered-module', 'category': 'docs-gap', 'confidence': 0.78, 'autofix': False},
-    {'rule': 'doc-drift-stale-reference', 'category': 'docs-drift', 'confidence': 0.8, 'autofix': False},
-    # xo linter rules for ky repo
-    {'rule': 'xo-max-lines', 'category': 'refactor', 'confidence': 0.85, 'autofix': True},
-    {'rule': 'xo-no-warning-comments', 'category': 'lint', 'confidence': 0.80, 'autofix': True},
-    {'rule': 'xo-complexity', 'category': 'refactor', 'confidence': 0.82, 'autofix': True},
-    # Python ruff linter rules for zulip repo
-    {'rule': 'ruff-b007', 'category': 'lint', 'confidence': 0.75, 'autofix': True},
-    {'rule': 'ruff-b904', 'category': 'bug', 'confidence': 0.80, 'autofix': False},
-    {'rule': 'ruff-e501', 'category': 'style', 'confidence': 0.65, 'autofix': True},
-    {'rule': 'ruff-s311', 'category': 'security', 'confidence': 0.78, 'autofix': False},
-    {'rule': 'ruff-c408', 'category': 'style', 'confidence': 0.72, 'autofix': False},
-    # Type safety rules (TypeScript/JavaScript)
-    {'rule': 'type-explicit-any', 'category': 'type-safety', 'confidence': 0.85, 'autofix': True},
-    {'rule': 'type-missing-return', 'category': 'type-safety', 'confidence': 0.80, 'autofix': True},
-    {'rule': 'type-missing-param', 'category': 'type-safety', 'confidence': 0.78, 'autofix': True},
-    {'rule': 'type-untyped-import', 'category': 'type-safety', 'confidence': 0.75, 'autofix': False},
-    # Test coverage rules
-    {'rule': 'test-coverage-branch', 'category': 'test-coverage', 'confidence': 0.82, 'autofix': True},
-    {'rule': 'test-coverage-function', 'category': 'test-coverage', 'confidence': 0.80, 'autofix': True},
-    {'rule': 'test-coverage-line', 'category': 'test-coverage', 'confidence': 0.78, 'autofix': False},
+# ── Language-grouped detector catalogs ──────────────────────────
+# Each rule entry is language-agnostic but tagged with a `language` field
+# for filtering. Rules are organized into separate named constants.
+
+GENERIC_RULES: List[Dict[str, Any]] = [
+    # Business-logic / project-specific rules (language-agnostic)
+    {'rule': 'discount-math-sign', 'category': 'bug', 'confidence': 0.95, 'autofix': True, 'language': 'generic'},
+    {'rule': 'catalog-query-not-normalized', 'category': 'bug', 'confidence': 0.93, 'autofix': True, 'language': 'generic'},
+    {'rule': 'orders-tax-truncation', 'category': 'bug', 'confidence': 0.92, 'autofix': False, 'language': 'generic'},
+    {'rule': 'notifications-email-no-trim', 'category': 'bug', 'confidence': 0.89, 'autofix': True, 'language': 'generic'},
+    {'rule': 'notifications-type-guard-missing', 'category': 'bug', 'confidence': 0.87, 'autofix': True, 'language': 'generic'},
+    {'rule': 'inventory-invalid-quantity', 'category': 'bug', 'confidence': 0.84, 'autofix': True, 'language': 'generic'},
+    {'rule': 'broad-except', 'category': 'lint', 'confidence': 0.88, 'autofix': False, 'language': 'generic'},
+    {'rule': 'hardcoded-tmp-path', 'category': 'lint', 'confidence': 0.81, 'autofix': True, 'language': 'generic'},
+    {'rule': 'trailing-whitespace', 'category': 'lint', 'confidence': 0.75, 'autofix': True, 'language': 'generic'},
+    {'rule': 'debt-todo-marker', 'category': 'todo/debt', 'confidence': 0.72, 'autofix': False, 'language': 'generic'},
+    {'rule': 'docs-legacy-reference', 'category': 'docs-mismatch', 'confidence': 0.91, 'autofix': True, 'language': 'generic'},
+    {'rule': 'docs-missing-rollback', 'category': 'docs-gap', 'confidence': 0.86, 'autofix': True, 'language': 'generic'},
+    {'rule': 'docs-quickstart-gap', 'category': 'docs-gap', 'confidence': 0.74, 'autofix': True, 'language': 'generic'},
+    {'rule': 'perf-pop-front-loop', 'category': 'perf-smell', 'confidence': 0.83, 'autofix': True, 'language': 'generic'},
+    {'rule': 'perf-list-membership-loop', 'category': 'perf-smell', 'confidence': 0.82, 'autofix': True, 'language': 'generic'},
+    {'rule': 'test-gap-missing-file', 'category': 'test-gap', 'confidence': 0.79, 'autofix': True, 'language': 'generic'},
+    {'rule': 'test-gap-missing-case', 'category': 'test-gap', 'confidence': 0.77, 'autofix': True, 'language': 'generic'},
+    {'rule': 'doc-gap-uncovered-module', 'category': 'docs-gap', 'confidence': 0.78, 'autofix': False, 'language': 'generic'},
+    {'rule': 'doc-drift-stale-reference', 'category': 'docs-drift', 'confidence': 0.8, 'autofix': False, 'language': 'generic'},
 ]
+
+TYPESCRIPT_RULES: List[Dict[str, Any]] = [
+    # xo-linter / code-style rules
+    {'rule': 'xo-max-lines', 'category': 'refactor', 'confidence': 0.85, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'xo-no-warning-comments', 'category': 'lint', 'confidence': 0.80, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'xo-complexity', 'category': 'refactor', 'confidence': 0.82, 'autofix': True, 'language': 'typescript'},
+    # Type-safety rules
+    {'rule': 'type-explicit-any', 'category': 'type-safety', 'confidence': 0.85, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'type-missing-return', 'category': 'type-safety', 'confidence': 0.80, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'type-missing-param', 'category': 'type-safety', 'confidence': 0.78, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'type-untyped-import', 'category': 'type-safety', 'confidence': 0.75, 'autofix': False, 'language': 'typescript'},
+    # Test-coverage rules
+    {'rule': 'test-coverage-branch', 'category': 'test-coverage', 'confidence': 0.82, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'test-coverage-function', 'category': 'test-coverage', 'confidence': 0.80, 'autofix': True, 'language': 'typescript'},
+    {'rule': 'test-coverage-line', 'category': 'test-coverage', 'confidence': 0.78, 'autofix': False, 'language': 'typescript'},
+]
+
+GO_RULES: List[Dict[str, Any]] = [
+    # Staticcheck rules (Go)
+    {'rule': 'go-staticcheck-sa', 'category': 'bug', 'confidence': 0.90, 'autofix': False, 'language': 'go'},
+    {'rule': 'go-staticcheck-st', 'category': 'style', 'confidence': 0.80, 'autofix': False, 'language': 'go'},
+    {'rule': 'go-staticcheck-s1000', 'category': 'simplify', 'confidence': 0.85, 'autofix': True, 'language': 'go'},
+    {'rule': 'go-unused', 'category': 'dead-code', 'confidence': 0.88, 'autofix': False, 'language': 'go'},
+]
+
+SHELL_RULES: List[Dict[str, Any]] = [
+    # ShellCheck rules (shell/bash)
+    {'rule': 'shellcheck-sc2002', 'category': 'lint', 'confidence': 0.85, 'autofix': False, 'language': 'shell'},
+    {'rule': 'shellcheck-sc2006', 'category': 'lint', 'confidence': 0.85, 'autofix': False, 'language': 'shell'},
+    {'rule': 'shellcheck-sc2086', 'category': 'bug', 'confidence': 0.92, 'autofix': False, 'language': 'shell'},
+    {'rule': 'shellcheck-sc2162', 'category': 'lint', 'confidence': 0.80, 'autofix': False, 'language': 'shell'},
+    {'rule': 'shellcheck-general', 'category': 'lint', 'confidence': 0.78, 'autofix': False, 'language': 'shell'},
+]
+
+DOCKER_RULES: List[Dict[str, Any]] = [
+    # Hadolint rules (Dockerfile)
+    {'rule': 'hadolint-dl3008', 'category': 'security', 'confidence': 0.88, 'autofix': False, 'language': 'dockerfile'},
+    {'rule': 'hadolint-dl3009', 'category': 'lint', 'confidence': 0.80, 'autofix': False, 'language': 'dockerfile'},
+    {'rule': 'hadolint-dl3013', 'category': 'lint', 'confidence': 0.82, 'autofix': False, 'language': 'dockerfile'},
+    {'rule': 'hadolint-dl3040', 'category': 'security', 'confidence': 0.85, 'autofix': False, 'language': 'dockerfile'},
+    {'rule': 'hadolint-dl3042', 'category': 'security', 'confidence': 0.87, 'autofix': False, 'language': 'dockerfile'},
+    {'rule': 'hadolint-general', 'category': 'lint', 'confidence': 0.78, 'autofix': False, 'language': 'dockerfile'},
+]
+
+MARKDOWN_RULES: List[Dict[str, Any]] = [
+    # Markdownlint rules
+    {'rule': 'mdl-header-increment', 'category': 'style', 'confidence': 0.75, 'autofix': False, 'language': 'markdown'},
+    {'rule': 'mdl-bare-url', 'category': 'style', 'confidence': 0.70, 'autofix': False, 'language': 'markdown'},
+    {'rule': 'mdl-no-trailing-spaces', 'category': 'style', 'confidence': 0.72, 'autofix': True, 'language': 'markdown'},
+    {'rule': 'mdl-line-length', 'category': 'style', 'confidence': 0.65, 'autofix': False, 'language': 'markdown'},
+    {'rule': 'mdl-blanks-around-headers', 'category': 'style', 'confidence': 0.70, 'autofix': False, 'language': 'markdown'},
+    {'rule': 'mdl-blanks-around-lists', 'category': 'style', 'confidence': 0.70, 'autofix': False, 'language': 'markdown'},
+    {'rule': 'mdl-general', 'category': 'style', 'confidence': 0.68, 'autofix': False, 'language': 'markdown'},
+]
+
+ACTIONS_RULES: List[Dict[str, Any]] = [
+    # Actionlint rules (GitHub Actions workflows)
+    {'rule': 'actionlint-general', 'category': 'lint', 'confidence': 0.90, 'autofix': False, 'language': 'github-actions'},
+    {'rule': 'actionlint-shellcheck', 'category': 'bug', 'confidence': 0.92, 'autofix': False, 'language': 'github-actions'},
+    {'rule': 'actionlint-expression', 'category': 'bug', 'confidence': 0.88, 'autofix': False, 'language': 'github-actions'},
+]
+
+SECRET_RULES: List[Dict[str, Any]] = [
+    # Gitleaks secret scanning rules
+    {'rule': 'secret-aws-key', 'category': 'secret', 'confidence': 0.98, 'autofix': False, 'language': 'generic'},
+    {'rule': 'secret-github-token', 'category': 'secret', 'confidence': 0.98, 'autofix': False, 'language': 'generic'},
+    {'rule': 'secret-generic-api-key', 'category': 'secret', 'confidence': 0.95, 'autofix': False, 'language': 'generic'},
+    {'rule': 'secret-private-key', 'category': 'secret', 'confidence': 0.97, 'autofix': False, 'language': 'generic'},
+    {'rule': 'secret-high-entropy-string', 'category': 'secret', 'confidence': 0.85, 'autofix': False, 'language': 'generic'},
+]
+
+PYTHON_RULES: List[Dict[str, Any]] = [
+    # Ruff linter rules (Python)
+    {'rule': 'ruff-b007', 'category': 'lint', 'confidence': 0.75, 'autofix': True, 'language': 'python'},
+    {'rule': 'ruff-b904', 'category': 'bug', 'confidence': 0.80, 'autofix': False, 'language': 'python'},
+    {'rule': 'ruff-e501', 'category': 'style', 'confidence': 0.65, 'autofix': True, 'language': 'python'},
+    {'rule': 'ruff-s311', 'category': 'security', 'confidence': 0.78, 'autofix': False, 'language': 'python'},
+    {'rule': 'ruff-c408', 'category': 'style', 'confidence': 0.72, 'autofix': False, 'language': 'python'},
+]
+
+# Combined catalog for backward compatibility — all rules in one list.
+# Code that needs language filtering should use the language-specific constants above.
+DETECTOR_CATALOG: List[Dict[str, Any]] = GENERIC_RULES + TYPESCRIPT_RULES + GO_RULES + SHELL_RULES + DOCKER_RULES + MARKDOWN_RULES + ACTIONS_RULES + SECRET_RULES + PYTHON_RULES
 
 # Max-lines refactor limits - files larger than this won't be auto-refactored
 MAX_LINES_REFACTOR_LIMIT = 3000  # Maximum lines for auto-refactor

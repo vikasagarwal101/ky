@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parents[1] / 'core'))
 
 from sandbox_local_runner.reforge import classify_finding, RefactorClass
@@ -12,7 +14,8 @@ from sandbox_local_runner.models import Finding
 
 ZULIP_FINDINGS = Path(__file__).parents[1] / 'repos/zulip/state/findings.jsonl'
 
-
+if not ZULIP_FINDINGS.exists():
+    pytest.skip("Zulip findings data not available -- skipping live migration tests", allow_module_level=True)
 def _load_findings():
     findings = []
     with open(ZULIP_FINDINGS) as f:

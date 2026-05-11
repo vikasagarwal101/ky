@@ -113,6 +113,31 @@ class RunEngine:
             return shutil.which('opencode') is not None
         return False
 
+    def _cleanup_stale_artifacts(self) -> None:
+        """Clean up stale lock files and orphaned worktrees on startup."""
+        lock_dir = self.config.workspace / 'locks'
+        if lock_dir.exists():
+            stale_cutoff = datetime.now(timezone.utc).timestamp() - 14400  # 4 hours
+            for lock_file in lock_dir.glob('*.lock'):
+                try:
+                    if lock_file.stat().st_mtime < stale_cutoff:
+                        lock_file.unlink()
+                except (OSError, ValueError):
+                    pass
+
+        # Prune orphaned worktree references in repo clones
+        repos_dir = self.config.workspace / 'repos'
+        if repos_dir.exists():
+            for repo_dir in repos_dir.iterdir():
+                git_dir = repo_dir / '.git'
+                if git_dir.exists():
+                    subprocess.run(
+                        ['git', 'worktree', 'prune'],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=30,
+                    )
+
     def _resolve_backend(self, repo: Repo, requested_backend: Optional[str]) -> Dict[str, Optional[str]]:
         config = repo.config
         preferred = requested_backend or config.fix_engine
@@ -196,14 +221,47 @@ class RunEngine:
             args.append('--live-github-actions')
         if config.github.get('auto_merge', False):
             args.append('--auto-merge-sandbox')
-        if config.github.get('auto_rebase', {}).get('enabled', True):
+        auto_rebase_cfg = config.github.get('auto_rebase', {})
+        if auto_rebase_cfg.get('enabled', True):
             args.append('--auto-rebase-enabled')
-            rebase_max = config.github['auto_rebase'].get('max_prs_per_sweep', 5)
+            rebase_max = auto_rebase_cfg.get('max_prs_per_sweep', 5)
             args.extend(['--rebase-max-prs', str(rebase_max)])
 
         # Baseline checks (per-repo validation commands)
         if config.baseline_checks:
             args.extend(['--baseline-checks', json.dumps(config.baseline_checks)])
+
+        # Auto-tune overrides — read from state/auto_tune.json and apply
+        tune_path = self.config.workspace / 'state' / 'auto_tune.json'
+        try:
+            if tune_path.exists():
+                tune = json.loads(tune_path.read_text())
+                tuned = tune.get('tuned_fields', {})
+                if tuned:
+                    overrides: List[str] = []
+                    if 'max_prs_per_run' in tuned:
+                        val = int(tuned['max_prs_per_run'])
+                        idx = args.index('--max-prs-per-run') + 1
+                        args[idx] = str(val)
+                        overrides.append(f'max_prs_per_run={val}')
+                    if 'finding_cooldown_seconds' in tuned:
+                        val = int(tuned['finding_cooldown_seconds'])
+                        idx = args.index('--finding-cooldown-seconds') + 1
+                        args[idx] = str(val)
+                        overrides.append(f'finding_cooldown={val // 3600}h')
+                    if overrides:
+                        args.extend(['--tune-override', '; '.join(overrides)])
+        except (OSError, json.JSONDecodeError, ValueError, IndexError):
+            pass
+
+        # Inject skip-rules for exhausted rule+path combos
+        # (Task 2: discovery-layer auto-suppression)
+        try:
+            skips = self.state.get_exhausted_skips(repo_name)
+            if skips:
+                args.extend(['--skip-rules', json.dumps(skips)])
+        except Exception:
+            pass
 
         return args
     
@@ -250,6 +308,63 @@ class RunEngine:
             f"retry_failed_prs={result.retry_failed_prs} retry_exhausted_prs={result.retry_exhausted_prs} "
             f"merge_ready_prs={result.merge_ready_prs} paused_prs={result.paused_prs}"
         )
+        # Persist review telemetry as structured JSONL
+        review_stats_file = self.config.workspace / 'state' / 'review_stats.jsonl'
+        try:
+            review_stats_file.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                'timestamp': now_iso(),
+                'repo': repo.config.name,
+                'dry_run': dry_run,
+                'active_prs': result.active_prs,
+                'blocked_prs': result.blocked_prs,
+                'retry_eligible': result.retry_eligible_prs,
+                'retry_planned': result.retry_planned_prs,
+                'retry_prepared': result.retry_prepared_prs,
+                'retry_executed': result.retry_executed_prs,
+                'retry_failed': result.retry_failed_prs,
+                'retry_exhausted': result.retry_exhausted_prs,
+                'merge_ready': result.merge_ready_prs,
+                'paused': result.paused_prs,
+                'findings_detected': result.findings_detected,
+                'findings_published': result.findings_published,
+                'findings_failed': result.findings_failed,
+            }
+            with open(review_stats_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, default=str) + '\n')
+        except OSError:
+            pass
+
+        # Auto-tune: check telemetry patterns and adjust thresholds
+        from .auto_tune import compute_tune, flag_tune_success
+        tune_path = self.config.workspace / 'state' / 'auto_tune.json'
+        if result.retry_failed_prs == 0 and result.findings_failed == 0:
+            flag_tune_success(tune_path)
+        else:
+            tune_suggestion = compute_tune(review_stats_file, tune_path)
+            if tune_suggestion:
+                reason = tune_suggestion.get('_reason', 'retry/finding failure pattern detected')
+                print(f'[auto-tune] {reason} — adjusting thresholds')
+
+        # Cross-cycle signal: if retry failures persist, inform issue cycle
+        from .cycle_signals import CycleSignalStore
+        signal_store = CycleSignalStore(self.config.workspace / 'state' / 'cycle_signals.json')
+        if result.retry_failed_prs > 0:
+            signal_store.suppress_rule(
+                '__global__',
+                f'retry_failed x{result.retry_failed_prs} in review cycle — deprioritize new issue creation',
+                duration_cycles=8,
+            )
+        elif result.retry_exhausted_prs > 0:
+            signal_store.suppress_rule(
+                '__global__',
+                f'retry_exhausted x{result.retry_exhausted_prs} — exhaustive failures detected',
+                duration_cycles=12,
+            )
+        else:
+            # Clean cycle — lift any active global suppression
+            signal_store.lift_suppression('__global__')
+
         (log_dir / f'{run.id}.log').write_text(output + '\n', encoding='utf-8')
 
         run.ended_at = now_iso()
@@ -260,10 +375,44 @@ class RunEngine:
         run.status = 'completed'
 
         findings = self.state.load_findings(repo.config.name)
+
+        # Sync exhausted rule+path patterns from issues that have
+        # exceeded max fix attempts (needs-human-max-retries-exceeded)
+        exhausted_new = self.state.sync_exhausted_from_issues(repo.config.name)
+        if exhausted_new:
+            print(f'[exhausted-sync] {exhausted_new} new exhausted rule+path entries recorded')
+
         health_score = self.health.calculate(findings)
         run.health_before = repo.current_health_score
         run.health_after = health_score.score
         run.health_delta = health_score.score - repo.current_health_score
+
+        # Health trend — one record per cycle
+        _trend_file = self.config.workspace / 'state' / 'health_trend.jsonl'
+        try:
+            _trend_file.parent.mkdir(parents=True, exist_ok=True)
+            _tune_state = {}
+            _tune_path = self.config.workspace / 'state' / 'auto_tune.json'
+            if _tune_path.exists():
+                _tune_state = json.loads(_tune_path.read_text()).get('tuned_fields', {})
+            _trend_record = {
+                'ts': now_iso(),
+                'repo': repo.config.name,
+                'cycle': 'review',
+                'health_score': health_score.score,
+                'open_issues': len(findings),
+                'active_prs': result.active_prs,
+                'blocked_prs': result.blocked_prs,
+                'retry_failed': result.retry_failed_prs,
+                'retry_exhausted': result.retry_exhausted_prs,
+                'merge_ready': result.merge_ready_prs,
+                'tune_batch': _tune_state.get('max_prs_per_run'),
+                'tune_cooldown_h': _tune_state.get('finding_cooldown_seconds', 0) // 3600 if 'finding_cooldown_seconds' in _tune_state else None,
+            }
+            with open(_trend_file, 'a', encoding='utf-8') as _f:
+                _f.write(json.dumps(_trend_record, default=str) + '\n')
+        except OSError:
+            pass
 
         self.registry.update(repo.config.name, {
             'status': RepoStatus.READY.value,
@@ -278,12 +427,21 @@ class RunEngine:
             len(findings),
             self.state._get_state_dir(repo.config.name)
         )
+
+        # Rotate findings.jsonl if it exceeds thresholds
+        archived = self.state._rotate_findings_if_needed(repo.config.name)
+        if archived:
+            print(f'[findings-rotation] archived {archived} stale findings for {repo.config.name}')
+
         return RunResult(run=run, success=True, output=output)
     
     def run(self, repo: Repo, options: RunOptions) -> RunResult:
         """Execute a run for a repo."""
         repo_name = repo.config.name
         run_id = generate_id('run')
+
+        # Clean up stale artifacts from previous runs
+        self._cleanup_stale_artifacts()
         
         resolved_backend = self._resolve_backend(repo, options.fix_engine)
 
@@ -313,11 +471,14 @@ class RunEngine:
             self.state.save_run(repo_name, run)
             return RunResult(run=run, success=False, output='', error=run.error)
 
-        # Update repo status
-        self.registry.update(repo_name, {
-            'status': RepoStatus.RUNNING.value,
-        })
-        
+        # Update repo status — inside try so errors are caught
+        try:
+            self.registry.update(repo_name, {
+                'status': RepoStatus.RUNNING.value,
+            })
+        except Exception:
+            pass
+
         try:
             if options.phase == 'review-cycle':
                 return self._run_review_cycle(repo, run, log_dir, options.dry_run, options.allow_review_push)
@@ -360,7 +521,35 @@ class RunEngine:
             run.health_before = repo.current_health_score
             run.health_after = health_score.score
             run.health_delta = health_score.score - repo.current_health_score
-            
+
+            # Health trend record
+            _trend_file = self.config.workspace / 'state' / 'health_trend.jsonl'
+            try:
+                _trend_file.parent.mkdir(parents=True, exist_ok=True)
+                _tune_state = {}
+                _tune_path = self.config.workspace / 'state' / 'auto_tune.json'
+                if _tune_path.exists():
+                    _tune_state = json.loads(_tune_path.read_text()).get('tuned_fields', {})
+                _trend_record = {
+                    'ts': now_iso(),
+                    'repo': repo_name,
+                    'cycle': options.phase,
+                    'health_score': health_score.score,
+                    'open_issues': len(findings),
+                    'findings_detected': metrics.get('findings_detected', 0),
+                    'issues_created': metrics.get('issues_created', 0),
+                    'fixes_verified': metrics.get('fixes_verified', 0),
+                    'fixes_failed': metrics.get('fixes_failed', 0),
+                    'prs_created': metrics.get('prs_created', 0),
+                    'merges_completed': metrics.get('merges_completed', 0),
+                    'tune_batch': _tune_state.get('max_prs_per_run'),
+                    'tune_cooldown_h': _tune_state.get('finding_cooldown_seconds', 0) // 3600 if 'finding_cooldown_seconds' in _tune_state else None,
+                }
+                with open(_trend_file, 'a', encoding='utf-8') as _f:
+                    _f.write(json.dumps(_trend_record, default=str) + '\n')
+            except OSError:
+                pass
+
             # Update repo state
             self.registry.update(repo_name, {
                 'status': RepoStatus.READY.value,

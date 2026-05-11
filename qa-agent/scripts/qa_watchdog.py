@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """QA Agent watchdog — inspects latest run state and logs for both repos."""
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -102,7 +104,83 @@ def check():
                 for l in error_lines[-3:]:
                     alerts.append(f"    {l[:120]}")
 
+    # Cross-repo: check review cycle telemetry for summary
+    review_stats = ROOT / 'state' / 'review_stats.jsonl'
+    if review_stats.exists():
+        try:
+            lines = review_stats.read_text().strip().splitlines()
+            if lines:
+                latest = json.loads(lines[-1])
+                alerts.append('--- review cycle ---')
+                alerts.append(f'  active: {latest.get("active_prs",0)} | blocked: {latest.get("blocked_prs",0)} | merge-ready: {latest.get("merge_ready",0)}')
+                if latest.get("retry_failed",0) > 0 or latest.get("retry_exhausted",0) > 0:
+                    alerts.append(f'  ⚠ retry failures: {latest.get("retry_failed",0)} exhausted: {latest.get("retry_exhausted",0)}')
+                if latest.get("findings_failed",0) > 0:
+                    alerts.append(f'  ⚠ findings failed: {latest.get("findings_failed",0)}')
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Cross-repo: check escalation log for active patterns
+    escalation_file = ROOT / 'state' / 'escalation_log.jsonl'
+    if escalation_file.exists():
+        try:
+            unread = []
+            for line in escalation_file.read_text().strip().splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                for f in rec.get('findings', []):
+                    unread.append(f'  ⚠ {f["type"]}: {f["detail"]}')
+            if unread:
+                alerts.append('--- escalations ---')
+                alerts.extend(unread[-5:])  # last 5 only
+        except (json.JSONDecodeError, OSError):
+            pass
+
     return "\n".join(alerts)
 
+def smoke_test() -> str:
+    """Run a quick dry cycle per repo to confirm the agent starts and completes."""
+    lines: list[str] = []
+    all_passed = True
+    for repo in REPOS:
+        start = time.time()
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "sandbox_local_runner",
+                    "--repo-path", str(ROOT / "repos" / repo),
+                    "status",
+                    "--dry-run",
+                    "--findings-limit", "1",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            elapsed = time.time() - start
+            if result.returncode == 0:
+                lines.append(f"  ✅ {repo} smoke-test passed ({elapsed:.1f}s)")
+            else:
+                lines.append(f"  ❌ {repo} smoke-test FAILED rc={result.returncode} ({elapsed:.1f}s)")
+                lines.append(f"     stderr: {result.stderr.strip()[-200:]}")
+                all_passed = False
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            lines.append(f"  ❌ {repo} smoke-test TIMEOUT (>30s)")
+            all_passed = False
+        except Exception as exc:
+            lines.append(f"  ❌ {repo} smoke-test ERROR: {exc}")
+            all_passed = False
+
+    prefix = "✅ HEALTH OK" if all_passed else "❌ HEALTH FAILURE"
+    return f"{prefix}\n" + "\n".join(lines)
+
+
 if __name__ == "__main__":
-    print(check())
+    args = sys.argv[1:]
+    if "--smoke-test" in args:
+        print(smoke_test())
+    else:
+        print(check())

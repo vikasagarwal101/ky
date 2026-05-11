@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+#
+# ceph — QA Agent CLI wrapper
+#
+# Maps human-friendly subcommands to the qa-agent Python CLI.
+# Works from any directory by resolving paths relative to the script location.
+#
+
+set -euo pipefail
+
+CEPH_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+QA_AGENT="$CEPH_DIR/qa-agent"
+PYTHON="python3"
+
+VERSION="2.5.0"
+
+# ── Color helpers (no-op if not a TTY) ──────────────────────────
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'; DIM='\033[2m'; CYAN='\033[36m'; GREEN='\033[32m'
+    YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
+else
+    BOLD=''; DIM=''; CYAN=''; GREEN=''; YELLOW=''; RED=''; RESET=''
+fi
+
+usage() {
+    cat <<EOF
+${BOLD}ceph${RESET} ${DIM}— Keep your waters clean. Ink and dust.${RESET}
+
+${BOLD}Usage:${RESET}
+  ceph ${GREEN}<command>${RESET} [${YELLOW}options${RESET}]
+  ceph ${GREEN}help${RESET} [${CYAN}<command>${RESET}]       Show help for a specific command
+
+${BOLD}Commands:${RESET}
+
+  ${GREEN}init${RESET}             ${DIM}Interactive first-run setup wizard${RESET}
+  ${GREEN}onboard${RESET}          ${DIM}Headless onboarding for a new repo${RESET}
+  ${GREEN}install${RESET}          ${DIM}Print install/setup instructions${RESET}
+  ${GREEN}update${RESET}           ${DIM}Self-update qa-agent to the latest version${RESET}
+
+  ${GREEN}scan${RESET}      <name> ${DIM}Run discovery/issue-cycle scan on a repo${RESET}
+  ${GREEN}ink${RESET}       <name> ${DIM}Fix issues and open PRs for a repo${RESET}
+  ${GREEN}duster${RESET}    <name> ${DIM}Dry-run a scan to preview findings without changes${RESET}
+  ${GREEN}doctor${RESET}    <name> ${DIM}Run operational checks/diagnostics on a repo${RESET}
+  ${GREEN}run${RESET}       <name> ${DIM}Run full orchestrated QA cycle on a repo${RESET}
+  ${GREEN}secrets${RESET}     <path> ${DIM}Scan for hardcoded secrets in a repo${RESET}
+  ${GREEN}health${RESET}      <name> ${DIM}Show health score for a repo${RESET}
+  ${GREEN}report${RESET}      <name> ${DIM}Generate a QA report${RESET}
+
+  ${GREEN}ci${RESET}           <name> ${DIM}Generate GitHub Actions CI workflow${RESET}
+  ${GREEN}install-hook${RESET} <name> ${DIM}Install pre-commit hook that runs ceph duster${RESET}
+
+  ${GREEN}status${RESET}             ${DIM}Show agent or repo status${RESET}
+  ${GREEN}preflight${RESET}          ${DIM}Assess a repository before onboarding${RESET}
+  ${GREEN}heal${RESET}               ${DIM}Repair dirty worktrees caused by transient artifacts${RESET}
+
+  ${GREEN}help${RESET}               ${DIM}Show this help message${RESET}
+
+${BOLD}Options:${RESET}
+  --version           Show version
+  -h, --help          Show this help message and exit
+
+${DIM}Examples:${RESET}
+  ceph init            ${DIM}# Interactive wizard${RESET}
+  ceph install         ${DIM}# Show install instructions${RESET}
+  ceph scan zulip      ${DIM}# Scan a repo for issues${RESET}
+  ceph ink qa-sandbox  ${DIM}# Fix issues and open PRs${RESET}
+  ceph health ky       ${DIM}# Show health score${RESET}
+EOF
+}
+
+help_init() {
+    cat <<EOF
+${BOLD}ceph init${RESET}
+
+${DIM}Interactive first-run setup wizard.${RESET}
+
+Walks you through prerequisites check (python3, git, gh, uv),
+GitHub authentication, repo selection, safety mode selection,
+and optional cron installation.
+
+${BOLD}Usage:${RESET}
+  ceph init
+
+${BOLD}Safety modes:${RESET}
+  observe       — dry-run only, no GitHub changes
+  issue-only    — creates issues, no PRs
+  pr            — creates issues and PRs, no merges
+  merge         — full autonomy including merges
+
+${BOLD}See also:${RESET}
+  ceph onboard --help     # Headless alternative to init
+  ceph install            # Installation instructions
+EOF
+}
+
+help_onboard() {
+    cat <<EOF
+${BOLD}ceph onboard${RESET}
+
+${DIM}Headless onboarding for a new repository.${RESET}
+
+Non-interactive version of init. Onboards a repo with explicit
+flags, suitable for scripting and automation.
+
+${BOLD}Usage:${RESET}
+  ceph onboard --repo ${CYAN}<path>${RESET} [options]
+  ceph onboard --repo ${CYAN}<path>${RESET} --mode ${CYAN}observe${RESET} --profile ${CYAN}conservative${RESET}
+
+${BOLD}Options:${RESET}
+  --repo ${CYAN}<path>${RESET}         Path to the repository
+  --name ${CYAN}<name>${RESET}         Name for this repo (default: directory name)
+  --mode ${CYAN}<mode>${RESET}         Safety mode (observe, issue-only, pr, merge)
+  --profile ${CYAN}<profile>${RESET}   Safety profile (conservative, balanced, aggressive)
+  --skip-baseline         Skip baseline capture
+  --allow-dirty-worktree  Allow onboarding without a clean working tree
+EOF
+}
+
+help_install() {
+    cat <<EOF
+${BOLD}ceph install${RESET}
+
+${DIM}Print installation/setup instructions.${RESET}
+
+${BOLD}Quick Install:${RESET}
+  # 1. Clone the QA Agent
+  git clone <repo-url> ~/.ceph
+  cd ~/.ceph
+
+  # 2. Bootstrap
+  ./scripts/bootstrap.sh
+
+  # 3. Symlink ceph to PATH
+  ln -sf "\$(pwd)/bin/ceph" ~/.local/bin/ceph
+
+  # 4. Verify
+  ceph --version
+  ceph help
+
+${BOLD}Requirements:${RESET}
+  - Python 3.11+
+  - Git
+  - GitHub CLI (gh)
+  - uv (https://docs.astral.sh/uv/)
+  - (optional) Docker for containerized linting
+  - (optional) Claude Code or OpenCode for LLM fix backends
+
+${BOLD}After install:${RESET}
+  ceph init              # Interactive setup
+  ceph scan <repo>       # First scan
+EOF
+}
+
+help_scan() {
+    cat <<EOF
+${BOLD}ceph scan${RESET}
+
+${DIM}Run a discovery/issue-cycle scan on a repository.${RESET}
+
+Discovers findings using linting, type checks, test-coverage analysis,
+and rule-based detectors. Creates GitHub issues for findings that
+exceed the configured threshold.
+
+${BOLD}Usage:${RESET}
+  ceph scan ${CYAN}<repo-name>${RESET}
+
+${BOLD}Example:${RESET}
+  ceph scan zulip
+
+${BOLD}Safety notes:${RESET}
+  - Respects the repo's safety mode (may be dry-run only)
+  - Creates issues only in issue-only, pr, and merge modes
+EOF
+}
+
+help_ink() {
+    cat <<EOF
+${BOLD}ceph ink${RESET}
+
+${DIM}Fix issues and open Pull Requests for a repository.${RESET}
+
+Takes existing findings, applies fixes (deterministic or LLM-backed),
+and opens GitHub PRs. Requires a prior scan or existing issues.
+
+${BOLD}Usage:${RESET}
+  ceph ink ${CYAN}<repo-name>${RESET}
+
+${BOLD}Example:${RESET}
+  ceph ink qa-sandbox
+
+${BOLD}Safety notes:${RESET}
+  - Blocked in observe and issue-only safety modes
+  - Creates actual PRs on GitHub (not dry-run)
+  - Use "ceph duster" first to preview findings
+EOF
+}
+
+help_duster() {
+    cat <<EOF
+${BOLD}ceph duster${RESET}
+
+${DIM}Dry-run a scan to preview findings without making changes.${RESET}
+
+Exactly like ceph scan, but never creates GitHub issues or PRs.
+Use this to preview what ceph would find before running a live
+scan or ink.
+
+${BOLD}Usage:${RESET}
+  ceph duster ${CYAN}<repo-name>${RESET}
+
+${BOLD}Example:${RESET}
+  ceph duster ky
+
+${BOLD}Why "duster"?${RESET}
+  A duster is a gentle, non-destructive way to remove dust.
+  Same idea here — preview findings without disturbing anything.
+EOF
+}
+
+help_doctor() {
+    cat <<EOF
+${BOLD}ceph doctor${RESET}
+
+${DIM}Run operational checks/diagnostics on a repository.${RESET}
+
+Checks that python3, git, gh, claude, opencode, docker, and the
+runner are available. Also checks gh authentication status and
+reports per-repo status.
+
+${BOLD}Usage:${RESET}
+  ceph doctor ${CYAN}<repo-name>${RESET}
+  ceph doctor                      # Check all repos
+
+${BOLD}Example:${RESET}
+  ceph doctor qa-agent
+EOF
+}
+
+help_run() {
+    cat <<EOF
+${BOLD}ceph run${RESET}
+
+${DIM}Run the full orchestrated QA cycle on a repository.${RESET}
+
+The complete multi-phase cycle: discover findings → create issues →
+apply fixes → open PRs → attempt merge. Under --dry-run this is a
+safe preview.
+
+${BOLD}Usage:${RESET}
+  ceph run ${CYAN}<repo-name>${RESET}
+
+${BOLD}Options (via --phase):${RESET}
+  issue-cycle   Scan and create issues only
+  pr-cycle      Fix issues and open PRs
+  review-cycle  Manage existing PR reviews
+  merge-cycle   Merge approved PRs
+  orchestrated  Full cycle (discover → fix → PR → merge)
+
+${BOLD}Example:${RESET}
+  ceph run --repo ky --phase issue-cycle --dry-run
+  ceph run --repo ky --phase orchestrated --no-dry-run
+
+${BOLD}Safety notes:${RESET}
+  Respects repo safety mode and dirty-tree gates
+  Use --dry-run (default) to preview before --no-dry-run
+EOF
+}
+
+help_health() {
+    cat <<EOF
+${BOLD}ceph health${RESET}
+
+${DIM}Show health score for a repository.${RESET}
+
+Displays a numeric health score (0-100) based on findings density,
+issue closure rate, fix success rate, and component scores for
+bug quality, lint quality, technical debt, documentation, etc.
+
+${BOLD}Usage:${RESET}
+  ceph health ${CYAN}<repo-name>${RESET}
+
+${BOLD}Example:${RESET}
+  ceph health ky
+  ceph health qa-sandbox
+EOF
+}
+
+help_status() {
+    cat <<EOF
+${BOLD}ceph status${RESET}
+
+${DIM}Show agent or repository status.${RESET}
+
+Without --repo, shows all configured repos and their status at a
+glance. With --repo, shows detailed health, findings, engine,
+safety mode, and recent run history.
+
+${BOLD}Usage:${RESET}
+  ceph status                    # All repos
+  ceph status --repo ${CYAN}<name>${RESET}  # Single repo
+
+${BOLD}Example:${RESET}
+  ceph status
+  ceph status --repo ky
+EOF
+}
+
+help_report() {
+    cat <<EOF
+${BOLD}ceph report${RESET}
+
+${DIM}Generate a QA report for a repository.${RESET}
+
+Generates a report with health trends, finding categories, fix history,
+and review care diagnostics. Supports multiple output formats.
+
+${BOLD}Usage:${RESET}
+  ceph report ${CYAN}<repo-name>${RESET}
+  ceph report ${CYAN}<repo-name>${RESET} --output /tmp/report.pdf
+  ceph report ${CYAN}<repo-name>${RESET} --format text --days 7
+  ceph report ${CYAN}<repo-name>${RESET} --format json
+  ceph report ${CYAN}<repo-name>${RESET} --format html
+
+${BOLD}Options:${RESET}
+  --output, -o ${CYAN}<path>${RESET}  Output file path
+  --days ${CYAN}<N>${RESET}         Days of history (default: 30)
+  --format ${CYAN}<fmt>${RESET}     Output format: pdf, json, html, text, whatsapp
+
+${BOLD}Formats:${RESET}
+  pdf              ${DIM}PDF report with full details (default)${RESET}
+  json             ${DIM}Canonical JSON data model${RESET}
+  html             ${DIM}Dashboard HTML report (written to reports/<name>-report.html)${RESET}
+  text / whatsapp  ${DIM}Compact text summary${RESET}
+EOF
+}
+
+help_preflight() {
+    cat <<EOF
+${BOLD}ceph preflight${RESET}
+
+${DIM}Assess a repository before onboarding.${RESET}
+
+Checks that the target repo has everything needed: git, gh auth,
+clean working tree, language detection, plugin availability, Docker
+relevance, and suggests validation commands.
+
+${BOLD}Usage:${RESET}
+  ceph preflight --repo ${CYAN}<path>${RESET}
+
+${BOLD}Example:${RESET}
+  ceph preflight --repo ~/projects/my-app
+EOF
+}
+
+help_heal() {
+    cat <<EOF
+${BOLD}ceph heal${RESET}
+
+${DIM}Repair dirty worktrees caused by transient artifacts.${RESET}
+
+Detects and fixes dirty worktrees caused by common transient
+generated artifacts (__pycache__, .ruff_cache/, node_modules/,
+coverage/, etc.). Can add patterns to .gitignore and optionally
+remove the artifacts.
+
+${BOLD}Usage:${RESET}
+  ceph heal --repo ${CYAN}<path>${RESET}
+  ceph heal --repo ${CYAN}<path>${RESET} --no-dry-run
+  ceph heal --repo ${CYAN}<path>${RESET} --no-dry-run --remove-artifacts
+
+${BOLD}Options:${RESET}
+  --dry-run                Preview actions (default)
+  --no-dry-run             Execute healing
+  --remove-artifacts       Also delete transient artifact directories
+  --force                  Override safety check (not recommended)
+EOF
+}
+
+help_ci() {
+    cat <<EOF
+${BOLD}ceph ci${RESET}
+
+${DIM}Generate a GitHub Actions CI workflow (.github/workflows/ceph.yml).${RESET}
+
+Creates a GitHub Actions workflow that runs ceph scan on push/PR to main.
+Installs ceph, runs scan, and uploads findings as artifacts.
+
+${BOLD}Usage:${RESET}
+  ceph ci ${CYAN}<repo-name>${RESET}
+  ceph ci ${CYAN}<repo-name>${RESET} --force
+
+${BOLD}Options:${RESET}
+  --force   Overwrite existing workflow file if already present
+
+${BOLD}Example:${RESET}
+  ceph ci click-test
+  ceph ci click-test --force
+EOF
+}
+
+help_install-hook() {
+    cat <<EOF
+${BOLD}ceph install-hook${RESET}
+
+${DIM}Install a pre-commit hook that runs ceph duster on staged changes.${RESET}
+
+Creates .git/hooks/pre-commit in the target repository. The hook runs
+ceph duster (dry-run scan) on staged files before each commit.
+Skips binary file types automatically.
+
+${BOLD}Usage:${RESET}
+  ceph install-hook ${CYAN}<repo-name>${RESET}
+  ceph install-hook ${CYAN}<repo-name>${RESET} --force
+
+${BOLD}Options:${RESET}
+  --force   Overwrite existing pre-commit hook
+
+${BOLD}Example:${RESET}
+  ceph install-hook click-test
+
+${BOLD}To skip commit check:${RESET}
+  git commit --no-verify
+EOF
+}
+
+help_secrets() {
+    cat <<EOF
+${BOLD}ceph secrets${RESET}
+
+${DIM}Scan a repository for hardcoded secrets.${RESET}
+
+Uses gitleaks to detect API keys, tokens, passwords, private keys,
+and other secrets that may have been accidentally committed.
+
+${BOLD}Usage:${RESET}
+  ceph secrets ${CYAN}<repo-path>${RESET}
+  ceph secrets --repo ${CYAN}<path>${RESET}
+  ceph secrets --repo ${CYAN}<path>${RESET} --format json
+
+${BOLD}Options:${RESET}
+  --repo, -r ${CYAN}<path>${RESET}       Path to the repository
+  --format, -f ${CYAN}<fmt>${RESET}       Output format: text (default) or json
+  --verbose, -v                 Show gitleaks raw output
+
+${BOLD}Example:${RESET}
+  ceph secrets ~/projects/my-app
+  ceph secrets --repo ~/projects/my-app --format json
+
+${BOLD}Exit code:${RESET}
+  0 if no secrets found
+  1 if secrets are detected
+
+${BOLD}Note:${RESET}
+  Scans the working tree without git history (--no-git mode).
+  For full historical scans, run gitleaks directly on the git repo.
+EOF
+}
+
+help_update() {
+    cat <<EOF
+${BOLD}ceph update${RESET}
+
+${DIM}Self-update qa-agent to the latest version.${RESET}
+
+Detects install method (git clone or npm) and updates accordingly.
+
+${BOLD}Usage:${RESET}
+  ceph update
+
+${BOLD}Verification:${RESET}
+  ceph --version
+EOF
+}
+
+version() {
+    echo "ceph version ${VERSION}"
+    "$PYTHON" "$QA_AGENT" --version 2>/dev/null || true
+}
+
+# ── Per-command help ────────────────────────────────────────────
+command_help() {
+    local cmd="$1"
+    case "$cmd" in
+        init|onboard|install|scan|ink|duster|doctor|run|secrets|health|status|report|preflight|heal|update|ci|install-hook)
+            "help_${cmd}"
+            ;;
+        *)
+            echo "ceph: no help for '$cmd'. Try: ceph help" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Ensure qa-agent Python script exists
+if [[ ! -f "$QA_AGENT" ]]; then
+    echo "Error: qa-agent not found at $QA_AGENT" >&2
+    exit 1
+fi
+
+# No args → show help
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+CMD="$1"
+shift
+
+# Intercept --help for any command before dispatching
+case "${CMD}" in
+    help|-h|--help)
+        if [[ $# -eq 0 ]]; then
+            usage
+        else
+            command_help "$1"
+        fi
+        exit 0
+        ;;
+    --version)
+        version
+        exit 0
+        ;;
+esac
+
+# If the first arg looks like --help to a subcommand
+if [[ "$CMD" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+# Check for --help or -h in remaining args (ceph scan --help, ceph health --help etc.)
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            command_help "$CMD"
+            exit 0
+            ;;
+        -*)
+            # Skip other options, keep looking
+            ;;
+        *)
+            # First positional arg after command — not --help; stop looking
+            break
+            ;;
+    esac
+done
+
+case "$CMD" in
+    init)
+        "$PYTHON" "$QA_AGENT" init "$@"
+        ;;
+    install|setup)
+        help_install
+        ;;
+    scan)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph scan requires a repo name" >&2
+            echo "Usage: ceph scan <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" run --repo "$1" --phase issue-cycle "${@:2}"
+        ;;
+    ink)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph ink requires a repo name" >&2
+            echo "Usage: ceph ink <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" run --repo "$1" --phase pr-cycle "${@:2}"
+        ;;
+    duster)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph duster requires a repo name" >&2
+            echo "Usage: ceph duster <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" run --repo "$1" --phase issue-cycle --dry-run "${@:2}"
+        ;;
+    doctor)
+        if [[ $# -lt 1 ]]; then
+            "$PYTHON" "$QA_AGENT" doctor "$@"
+        else
+            "$PYTHON" "$QA_AGENT" doctor --repo "$1" "${@:2}"
+        fi
+        ;;
+    run)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph run requires a repo name" >&2
+            echo "Usage: ceph run <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" run --repo "$1" --phase orchestrated "${@:2}"
+        ;;
+    health)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph health requires a repo name" >&2
+            echo "Usage: ceph health <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" health --repo "$1" "${@:2}"
+        ;;
+    status)
+        "$PYTHON" "$QA_AGENT" status "$@"
+        ;;
+    preflight)
+        "$PYTHON" "$QA_AGENT" preflight "$@"
+        ;;
+    ci)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph ci requires a repo name" >&2
+            echo "Usage: ceph ci <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" ci --repo "$1" "${@:2}"
+        ;;
+    install-hook)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph install-hook requires a repo name" >&2
+            echo "Usage: ceph install-hook <repo-name>" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" install-hook --repo "$1" "${@:2}"
+        ;;
+    secrets)
+        "$PYTHON" "$CEPH_DIR/ceph_secrets.py" "$@"
+        ;;
+    onboard)
+        "$PYTHON" "$QA_AGENT" onboard "$@"
+        ;;
+    report)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: ceph report requires a repo name" >&2
+            echo "Usage: ceph report <repo-name> [options]" >&2
+            exit 1
+        fi
+        "$PYTHON" "$QA_AGENT" report --repo "$1" "${@:2}"
+        ;;
+    heal)
+        "$PYTHON" "$QA_AGENT" heal "$@"
+        ;;
+    update)
+        "$PYTHON" "$QA_AGENT" update "$@"
+        ;;
+    help)
+        if [[ $# -eq 0 ]]; then
+            usage
+        else
+            command_help "$1"
+        fi
+        ;;
+    *)
+        echo "ceph: unknown command '$CMD'" >&2
+        echo "Run 'ceph help' for available commands." >&2
+        exit 1
+        ;;
+esac

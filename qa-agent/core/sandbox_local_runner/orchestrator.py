@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +25,16 @@ from .linters import (
     discover_test_coverage_findings,
     discover_typescript_type_findings,
     discover_xo_linter_findings,
+    discover_eslint_findings,
+    discover_staticcheck_findings,
+    discover_shellcheck_findings,
+    discover_hadolint_findings,
+    discover_markdownlint_findings,
+    discover_actionlint_findings,
+    discover_gitleaks_findings,
 )
 from .models import Finding, now_iso, parse_iso, stable_finding_id
+from .plugin_loader import run_plugin_discovery
 from .reforge import RefactorClass, RefactorWork, can_auto_refactor, classify_finding
 from .refactor_queue import enqueue_refactor_work
 from .state import _append_text, save_refactor_work
@@ -537,6 +546,59 @@ def discover_findings(
         findings.extend(python_findings)
         _append_text(log_file, f'python-discovery: added {len(python_findings)} ruff findings')
     
+    # Run ESLint discovery for JS/TS repos
+    eslint_findings = discover_eslint_findings(repo_path, log_file)
+    if eslint_findings:
+        findings.extend(eslint_findings)
+        _append_text(log_file, f'eslint-discovery: added {len(eslint_findings)} ESLint findings')
+    
+    # Run staticcheck discovery for Go repos
+    staticcheck_findings = discover_staticcheck_findings(repo_path, log_file)
+    if staticcheck_findings:
+        findings.extend(staticcheck_findings)
+        _append_text(log_file, f'staticcheck-discovery: added {len(staticcheck_findings)} findings')
+    
+    # Run ShellCheck discovery for shell/bash repos
+    shellcheck_findings = discover_shellcheck_findings(repo_path, log_file)
+    if shellcheck_findings:
+        findings.extend(shellcheck_findings)
+        _append_text(log_file, f'shellcheck-discovery: added {len(shellcheck_findings)} findings')
+    
+    # Run hadolint discovery for Dockerfiles
+    hadolint_findings = discover_hadolint_findings(repo_path, log_file)
+    if hadolint_findings:
+        findings.extend(hadolint_findings)
+        _append_text(log_file, f'hadolint-discovery: added {len(hadolint_findings)} findings')
+    
+    # Run markdownlint discovery for Markdown files
+    markdownlint_findings = discover_markdownlint_findings(repo_path, log_file)
+    if markdownlint_findings:
+        findings.extend(markdownlint_findings)
+        _append_text(log_file, f'markdownlint-discovery: added {len(markdownlint_findings)} findings')
+    
+    # Run actionlint discovery for GitHub Actions workflows
+    actionlint_findings = discover_actionlint_findings(repo_path, log_file)
+    if actionlint_findings:
+        findings.extend(actionlint_findings)
+        _append_text(log_file, f'actionlint-discovery: added {len(actionlint_findings)} findings')
+    
+    # Run gitleaks secret scanning
+    gitleaks_findings = discover_gitleaks_findings(repo_path, log_file)
+    if gitleaks_findings:
+        findings.extend(gitleaks_findings)
+        _append_text(log_file, f'gitleaks-discovery: added {len(gitleaks_findings)} secret findings')
+    
+    # Run plugin-based discovery (language-specific plugins from plugins/ directory)
+    try:
+        plugin_findings = run_plugin_discovery(repo_path)
+        if plugin_findings:
+            findings.extend(plugin_findings)
+            _append_text(log_file, f'plugin-discovery: added {len(plugin_findings)} findings from plugins')
+            for pf in plugin_findings:
+                _append_text(log_file, f'  plugin: {pf.rule} @ {pf.path}:{pf.line}')
+    except Exception as e:
+        _append_text(log_file, f'plugin-discovery: error running plugins: {e}')
+    
     return findings
 
 
@@ -545,9 +607,29 @@ def create_issues_for_findings(
     findings: List[Finding],
     confidence_threshold: float,
     max_issues_per_run: int,
+    cycle_signals_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     existing = {str(x.get('finding_id')) for x in issues_data.get('issues', []) if x.get('finding_id')}
     created: List[Dict[str, Any]] = []
+
+    # Load cross-cycle signals to check for suppressed rules
+    _cycle_signal_checker = None
+    if cycle_signals_path is not None:
+        try:
+            from pathlib import Path as _Path
+            _signal_file = _Path(cycle_signals_path) if isinstance(cycle_signals_path, (str, _Path)) else cycle_signals_path
+            if _signal_file.exists():
+                # Inline read: check if this finding's rule is globally suppressed
+                _signal_data = json.loads(_signal_file.read_text())
+                _suppressed = _signal_data.get('suppressed_rules', {})
+                _now = datetime.now(timezone.utc).isoformat()
+                _active_suppressions = {
+                    r: info for r, info in _suppressed.items()
+                    if info.get('expires_at', '') > _now
+                }
+                _cycle_signal_checker = _active_suppressions
+        except (OSError, json.JSONDecodeError):
+            pass
 
     for finding in findings:
         if len(created) >= max_issues_per_run:
@@ -556,6 +638,31 @@ def create_issues_for_findings(
             continue
         if finding.finding_id in existing:
             continue
+
+        # Cross-cycle suppression check — skip suppressed rules
+        if _cycle_signal_checker:
+            _global_reason = _cycle_signal_checker.get('__global__')
+            if _global_reason:
+                created.append({
+                    'issue_id': 'SUPPRESSED',
+                    'finding_id': finding.finding_id,
+                    'rule': finding.rule,
+                    'status': 'suppressed_cross_cycle',
+                    'reason': _global_reason.get('reason', 'suppressed'),
+                    'created_at': now_iso(),
+                })
+                continue
+            _rule_reason = _cycle_signal_checker.get(finding.rule)
+            if _rule_reason:
+                created.append({
+                    'issue_id': 'SUPPRESSED',
+                    'finding_id': finding.finding_id,
+                    'rule': finding.rule,
+                    'status': 'suppressed_cross_cycle',
+                    'reason': _rule_reason.get('reason', 'suppressed'),
+                    'created_at': now_iso(),
+                })
+                continue
 
         issue_id = f"QA-{len(issues_data['issues']) + len(created) + 1:04d}"
         issue = {
